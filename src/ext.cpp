@@ -350,6 +350,7 @@ static QStyledItemDelegate* g_extDelegate = nullptr;
 
 static void applyColumn();          // fwd
 static void dumpButtons(const char* why);   // fwd
+static void dumpStatus(const char* why);    // fwd
 
 static void refreshExtColumn() {
     if (g_inRefresh) return;
