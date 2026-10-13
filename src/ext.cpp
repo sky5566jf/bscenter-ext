@@ -743,6 +743,7 @@ static bool triggerRun(int row, const char* why) {
 
 static qint64 g_lastSweep = 0;
 static QHash<QString, QString> g_lastRun;        // devId -> 上一次看到的「运行」列原文（主线程私有）
+static QHash<QString, QString> g_lastSkip;       // devId -> 上一次「暂不触发」的原因（只在变化时写日志）
 
 // 一次性快照：每行「运行」列原文 + 我们的判定 —— 用于核对判定是否与中控一致
 static void dumpStatus(const char* why) {
@@ -803,11 +804,19 @@ static void sweep() {
         for (auto it = g_dev.begin(); it != g_dev.end(); ++it) {
             if (!it->locked || it->bad) continue;
             const QString id = it.key();
+            const auto noteSkip = [&](const QString& reason) {
+                QString& last = g_lastSkip[id];
+                if (last != reason) {
+                    last = reason;
+                    logf("[watch] dev=%s 暂不触发：%s", id.toUtf8().constData(), reason.toUtf8().constData());
+                }
+            };
             const int row = rowOfDevId(m, g_cols.id, id);
-            if (row < 0) continue;
+            if (row < 0) { noteSkip(QStringLiteral("设备不在列表中")); continue; }
             const QString run = cellText(m, row, g_cols.run);
 
             if (looksRunning(run)) {
+                g_lastSkip.remove(id);
                 if (it->retries != 0) {
                     it->retries = 0; changed = true;
                     logf("[watch] dev=%s 已恢复运行", id.toUtf8().constData());
@@ -815,10 +824,19 @@ static void sweep() {
                 continue;
             }
             if (g_cfg.requireConn && g_cols.conn >= 0 &&
-                !cellText(m, row, g_cols.conn).contains(QStringLiteral("已连接"))) continue;
+                !cellText(m, row, g_cols.conn).contains(QStringLiteral("已连接"))) {
+                noteSkip(QStringLiteral("设备未连接（require_conn=1，置 0 可绕过）"));
+                continue;
+            }
             if (g_cfg.requireAuth && g_cols.auth >= 0 &&
-                !cellText(m, row, g_cols.auth).contains(QStringLiteral("已授权"))) continue;
-            if (now - it->lastTrigger < g_cfg.cooldownMs) continue;
+                !cellText(m, row, g_cols.auth).contains(QStringLiteral("已授权"))) {
+                noteSkip(QStringLiteral("设备未授权（require_auth=1，置 0 可绕过）"));
+                continue;
+            }
+            if (now - it->lastTrigger < g_cfg.cooldownMs) {
+                noteSkip(QStringLiteral("触发冷却中（cooldown_ms=%1）").arg(g_cfg.cooldownMs));
+                continue;
+            }
 
             if (it->retries >= g_cfg.maxRetry) {
                 it->bad = true; changed = true;
@@ -828,6 +846,7 @@ static void sweep() {
             it->lastTrigger = now;
             it->retries++;
             changed = true;
+            g_lastSkip.remove(id);
             jobs.append({id, row, "运行列为空/非运行态"});
             logf("[watch] dev=%s 运行列原文='%s' -> 判定未运行，准备触发 (retry=%d)",
                  id.toUtf8().constData(), run.toUtf8().constData(), it->retries);
