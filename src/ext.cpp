@@ -1,6 +1,22 @@
-// bbcenter_ext.dll — BBCenter（贝塔投屏中控）保活增强 PoC v0.1
+// bbcenter_ext.dll — BBCenter（贝塔投屏中控）保活增强 v0.2
 // 不修改目标程序字节：仅进程内 hook + 调用 Qt 公开 API。
 // 挂载点：① 右键设备菜单追加「保活锁定」 ② 列表真列「保活锁定」 ③ 主线程看门狗
+//
+// v0.2 修复
+//  1. 右键菜单项累加：厂商 deviceMenu 是常驻成员 QMenu，v0.1 每次 exec 都 addAction
+//     -> 改为「先清掉自己上一次加的（objectName=bbext），再追加」，菜单项恒为 3 个。
+//  2. 列表没出现「保活锁定」列：
+//     a) 默认 enable_column 改为 1（v0.1 是 0，等于没开）；
+//     b) ★真列实现从「换 view 的 model（QIdentityProxyModel）」改为
+//        「直接给厂商那个 QStandardItemModel 追加一列」——不换 model 对象、
+//        不重建 selectionModel、app 持有的 model 指针身份不变，零身份扰动；
+//        并挂 model 信号（modelReset/rowsInserted/rowsRemoved/dataChanged/layoutChanged）
+//        自动补写单元格，厂商整表刷新也不会丢列。
+//     c) 该列单独挂 QStyledItemDelegate，保证厂商自定义 delegate 不画我们的列时也能显示。
+//  3. 列标题匹配修正：厂商实际是「设备别名」不是「设备名称」（v0.1 name=-1）。
+//  4. 运行态判定修正：空闲值为「--」；v0.1 用 contains("运行") 会把「未运行」误判为运行。
+//  5. 死锁修复：看门狗持有 g_devMx 时调用 triggerRun -> app 刷新 model -> dataChanged
+//     回调要锁 g_devMx -> 自锁死。改为「锁内只收集任务，锁外触发」。
 #define WIN32_LEAN_AND_MEAN
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
@@ -19,6 +35,9 @@
 #include <QAbstractItemView>
 #include <QAbstractItemModel>
 #include <QIdentityProxyModel>
+#include <QStandardItemModel>
+#include <QStandardItem>
+#include <QStyledItemDelegate>
 #include <QMenu>
 #include <QAction>
 #include <QTimer>
@@ -64,12 +83,15 @@ static QString qFileInDir(const wchar_t* name) {
 struct Config {
     bool enabled = true;
     bool dryRun = true;
-    bool enableColumn = false;
+    bool enableColumn = true;              // v0.2: 默认开
     bool useCheck = true;
+    bool requireConn = true;
+    bool requireAuth = true;
     int  sweepMs = 10000;
     int  cooldownMs = 90000;
     int  maxRetry = 5;
     QString route = QStringLiteral("p1");
+    QString columnMode = QStringLiteral("insert");   // insert | proxy
 } g_cfg;
 
 static void loadConfig() {
@@ -80,11 +102,14 @@ static void loadConfig() {
             f.write("[ext]\n"
                     "enabled=1\n"
                     "dry_run=1\n"
-                    "enable_column=0\n"
+                    "enable_column=1\n"
+                    "column_mode=insert\n"
                     "sweep_ms=10000\n"
                     "cooldown_ms=90000\n"
                     "max_retry=5\n"
                     "use_check=1\n"
+                    "require_conn=1\n"
+                    "require_auth=1\n"
                     "trigger_route=p1\n");
             f.close();
         }
@@ -92,15 +117,21 @@ static void loadConfig() {
     QSettings s(ini, QSettings::IniFormat);
     g_cfg.enabled      = s.value("ext/enabled", 1).toInt() != 0;
     g_cfg.dryRun       = s.value("ext/dry_run", 1).toInt() != 0;
-    g_cfg.enableColumn = s.value("ext/enable_column", 0).toInt() != 0;
+    g_cfg.enableColumn = s.value("ext/enable_column", 1).toInt() != 0;
     g_cfg.useCheck     = s.value("ext/use_check", 1).toInt() != 0;
+    g_cfg.requireConn  = s.value("ext/require_conn", 1).toInt() != 0;
+    g_cfg.requireAuth  = s.value("ext/require_auth", 1).toInt() != 0;
     g_cfg.sweepMs      = s.value("ext/sweep_ms", 10000).toInt();
     g_cfg.cooldownMs   = s.value("ext/cooldown_ms", 90000).toInt();
     g_cfg.maxRetry     = s.value("ext/max_retry", 5).toInt();
     g_cfg.route        = s.value("ext/trigger_route", "p1").toString();
-    logf("[cfg] enabled=%d dry_run=%d enable_column=%d sweep=%dms cooldown=%dms max_retry=%d route=%s",
+    g_cfg.columnMode   = s.value("ext/column_mode", "insert").toString().trimmed().toLower();
+    if (g_cfg.columnMode != QStringLiteral("proxy")) g_cfg.columnMode = QStringLiteral("insert");
+    logf("[cfg] enabled=%d dry_run=%d enable_column=%d column_mode=%s sweep=%dms cooldown=%dms max_retry=%d route=%s conn=%d auth=%d",
          (int)g_cfg.enabled, (int)g_cfg.dryRun, (int)g_cfg.enableColumn,
-         g_cfg.sweepMs, g_cfg.cooldownMs, g_cfg.maxRetry, g_cfg.route.toUtf8().constData());
+         g_cfg.columnMode.toUtf8().constData(),
+         g_cfg.sweepMs, g_cfg.cooldownMs, g_cfg.maxRetry, g_cfg.route.toUtf8().constData(),
+         (int)g_cfg.requireConn, (int)g_cfg.requireAuth);
 }
 
 // ---------------------------------------------------------------- 锁定状态
@@ -116,19 +147,21 @@ static QHash<QString, DevState> g_dev;
 static std::mutex g_devMx;
 
 static void saveState() {
-    std::lock_guard<std::mutex> lk(g_devMx);
     QJsonObject root, devs;
-    root["ver"] = 1;
-    for (auto it = g_dev.begin(); it != g_dev.end(); ++it) {
-        QJsonObject o;
-        o["locked"] = it.value().locked;
-        o["bad"] = it.value().bad;
-        o["retries"] = it.value().retries;
-        o["lastTrigger"] = double(it.value().lastTrigger);
-        if (!it.value().alias.isEmpty()) o["alias"] = it.value().alias;
-        devs[it.key()] = o;
+    {
+        std::lock_guard<std::mutex> lk(g_devMx);
+        root["ver"] = 1;
+        for (auto it = g_dev.begin(); it != g_dev.end(); ++it) {
+            QJsonObject o;
+            o["locked"] = it.value().locked;
+            o["bad"] = it.value().bad;
+            o["retries"] = it.value().retries;
+            o["lastTrigger"] = double(it.value().lastTrigger);
+            if (!it.value().alias.isEmpty()) o["alias"] = it.value().alias;
+            devs[it.key()] = o;
+        }
+        root["devices"] = devs;
     }
-    root["devices"] = devs;
     const QString tmp = qFileInDir(L"bbcenter_ext.json.tmp");
     const QString dst = qFileInDir(L"bbcenter_ext.json");
     QFile f(tmp);
@@ -149,18 +182,20 @@ static void loadState() {
         return;
     }
     const QJsonObject devs = doc.object().value("devices").toObject();
-    std::lock_guard<std::mutex> lk(g_devMx);
-    for (auto it = devs.begin(); it != devs.end(); ++it) {
-        DevState st;
-        const QJsonObject o = it.value().toObject();
-        st.locked = o.value("locked").toBool();
-        st.bad = o.value("bad").toBool();
-        st.retries = o.value("retries").toInt();
-        st.lastTrigger = qint64(o.value("lastTrigger").toDouble());
-        st.alias = o.value("alias").toString();
-        g_dev[it.key()] = st;
+    {
+        std::lock_guard<std::mutex> lk(g_devMx);
+        for (auto it = devs.begin(); it != devs.end(); ++it) {
+            DevState st;
+            const QJsonObject o = it.value().toObject();
+            st.locked = o.value("locked").toBool();
+            st.bad = o.value("bad").toBool();
+            st.retries = o.value("retries").toInt();
+            st.lastTrigger = qint64(o.value("lastTrigger").toDouble());
+            st.alias = o.value("alias").toString();
+            g_dev[it.key()] = st;
+        }
+        logf("[state] loaded %d device(s)", (int)g_dev.size());
     }
-    logf("[state] loaded %d device(s)", (int)g_dev.size());
 }
 
 // ---------------------------------------------------------------- 控件定位
@@ -205,14 +240,14 @@ static Cols locateColumns(QAbstractItemModel* m) {
         else if (h == QStringLiteral("运行")) c.run = i;
         else if (h == QStringLiteral("连接")) c.conn = i;
         else if (h == QStringLiteral("授权")) c.auth = i;
-        else if (h == QStringLiteral("设备名称")) c.name = i;
+        else if (h == QStringLiteral("设备别名") || h == QStringLiteral("设备名称")) c.name = i;
         else if (h == QStringLiteral("备注")) c.remark = i;
     }
     return c;
 }
 
 static QString cellText(QAbstractItemModel* m, int row, int col) {
-    if (!m || col < 0 || row < 0 || row >= m->rowCount()) return QString();
+    if (!m || col < 0 || row < 0 || row >= m->rowCount() || col >= m->columnCount()) return QString();
     return m->data(m->index(row, col), Qt::DisplayRole).toString().trimmed();
 }
 
@@ -244,16 +279,127 @@ static void dumpList(const char* why) {
     }
 }
 
-// ---------------------------------------------------------------- 真列（代理模型）
+// ---------------------------------------------------------------- 运行态判定
+
+static bool looksRunning(const QString& s) {
+    const QString t = s.trimmed();
+    if (t.isEmpty()) return false;
+    if (t == QStringLiteral("--") || t == QStringLiteral("-") || t == QStringLiteral("—")) return false;
+    static const QStringList neg = {
+        QStringLiteral("未"), QStringLiteral("停止"), QStringLiteral("关闭"),
+        QStringLiteral("失败"), QStringLiteral("断开"), QStringLiteral("无"),
+        QStringLiteral("不")
+    };
+    for (const QString& n : neg) if (t.contains(n)) return false;
+    static const QStringList pos = {
+        QStringLiteral("运行"), QStringLiteral("播放"), QStringLiteral("投屏"),
+        QStringLiteral("启动"), QStringLiteral("已开")
+    };
+    for (const QString& p : pos) if (t.contains(p)) return true;
+    return false;
+}
+
+// ---------------------------------------------------------------- 锁定态文本
+
+static QString lockTextOf(const QString& id) {
+    bool locked = false, bad = false;
+    {
+        std::lock_guard<std::mutex> lk(g_devMx);
+        auto it = g_dev.constFind(id);
+        if (it != g_dev.constEnd()) { locked = it->locked; bad = it->bad; }
+    }
+    if (bad)    return QStringLiteral("❗ 异常停手");
+    if (locked) return QStringLiteral("🔒 已锁定");
+    return QStringLiteral("— 未锁定");
+}
+
+// ---------------------------------------------------------------- 真列 · 模式 insert（默认）
+// 直接给厂商的 QStandardItemModel 追加一列：不换 model 对象、不动 selectionModel。
 
 static Cols g_cols;
+static QStandardItemModel* g_std = nullptr;
+static QAbstractItemModel* g_hookedModel = nullptr;
+static int  g_extCol = -1;
+static bool g_inRefresh = false;
+static QStyledItemDelegate* g_extDelegate = nullptr;
 
+static void applyColumn();          // fwd
+
+static void refreshExtColumn() {
+    if (g_inRefresh) return;
+    if (!g_view || !g_std || g_extCol < 0) return;
+    if (g_extCol >= g_std->columnCount()) return;
+    if (g_cols.id < 0) return;
+    g_inRefresh = true;
+    const int n = g_std->rowCount();
+    for (int r = 0; r < n; ++r) {
+        const QString id = cellText(g_std, r, g_cols.id);
+        if (id.isEmpty()) continue;
+        const QString txt = lockTextOf(id);
+        QStandardItem* it = g_std->item(r, g_extCol);
+        if (!it) { it = new QStandardItem(); g_std->setItem(r, g_extCol, it); }
+        if (it->text() != txt) it->setText(txt);
+        it->setTextAlignment(Qt::AlignCenter);
+        it->setFlags(Qt::ItemIsEnabled | Qt::ItemIsSelectable);
+    }
+    g_inRefresh = false;
+}
+
+static void hookModelSignals(QAbstractItemModel* m) {
+    if (!m || g_hookedModel == m) return;
+    g_hookedModel = m;
+    // modelReset 里不动模型（厂商可能 clear 后立刻重建），推到事件循环再补列，避免在信号发射中改模型
+    QObject::connect(m, &QAbstractItemModel::modelReset, m, [m] { QTimer::singleShot(0, m, [] { applyColumn(); }); });
+    QObject::connect(m, &QAbstractItemModel::columnsInserted, m,
+                     [](const QModelIndex&, int, int) { refreshExtColumn(); });
+    QObject::connect(m, &QAbstractItemModel::rowsInserted, m,
+                     [](const QModelIndex&, int, int) { refreshExtColumn(); });
+    QObject::connect(m, &QAbstractItemModel::rowsRemoved, m,
+                     [](const QModelIndex&, int, int) { refreshExtColumn(); });
+    QObject::connect(m, &QAbstractItemModel::layoutChanged, m, [] { refreshExtColumn(); });
+    QObject::connect(m, &QAbstractItemModel::dataChanged, m,
+                     [](const QModelIndex&, const QModelIndex&, const QList<int>&) { refreshExtColumn(); });
+    logf("[column] model signals hooked (%p)", (void*)m);
+}
+
+static void applyColumnInsert() {
+    if (!g_view) return;
+    QAbstractItemModel* m = g_view->model();
+    auto* stdm = qobject_cast<QStandardItemModel*>(m);
+    if (!stdm) {
+        logf("[column] !! model 不是 QStandardItemModel（%s）— 请改 column_mode=proxy",
+             m ? m->metaObject()->className() : "null");
+        return;
+    }
+    if (g_std != stdm) { g_std = stdm; g_extCol = -1; }
+
+    if (g_extCol < 0 || stdm->columnCount() <= g_extCol) {
+        const int old = stdm->columnCount();
+        g_extCol = old;
+        stdm->setColumnCount(old + 1);
+        logf("[column] inserted extra col idx=%d (cols %d -> %d)", g_extCol, old, stdm->columnCount());
+    }
+    if (stdm->headerData(g_extCol, Qt::Horizontal, Qt::DisplayRole).toString()
+            != QStringLiteral("保活锁定")) {
+        stdm->setHeaderData(g_extCol, Qt::Horizontal, QStringLiteral("保活锁定"));
+    }
+    g_view->setColumnWidth(g_extCol, 96);
+    if (!g_extDelegate) {
+        g_extDelegate = new QStyledItemDelegate(g_view);
+        g_view->setItemDelegateForColumn(g_extCol, g_extDelegate);
+        logf("[column] per-column delegate installed on col %d", g_extCol);
+    }
+    hookModelSignals(stdm);
+    refreshExtColumn();
+    logf("[column] insert-mode ok, extCol=%d cols=%d rows=%d",
+         g_extCol, stdm->columnCount(), stdm->rowCount());
+}
+
+// ---------------------------------------------------------------- 真列 · 模式 proxy（备选）
 class LockProxy : public QIdentityProxyModel {
 public:
     explicit LockProxy(QObject* parent = nullptr) : QIdentityProxyModel(parent) {}
-
     int extraCol() const { return QIdentityProxyModel::columnCount(); }
-
     int columnCount(const QModelIndex& parent = QModelIndex()) const override {
         if (parent.isValid()) return QIdentityProxyModel::columnCount(parent);
         return QIdentityProxyModel::columnCount(parent) + 1;
@@ -276,13 +422,7 @@ public:
     QVariant data(const QModelIndex& idx, int role) const override {
         if (idx.isValid() && idx.column() == extraCol()) {
             const QString id = cellText(sourceModel(), idx.row(), g_cols.id);
-            bool locked = false, bad = false;
-            { std::lock_guard<std::mutex> lk(g_devMx);
-              auto it = g_dev.constFind(id);
-              if (it != g_dev.constEnd()) { locked = it->locked; bad = it->bad; } }
-            if (role == Qt::DisplayRole)
-                return bad ? QStringLiteral("❗ 异常停手")
-                           : (locked ? QStringLiteral("🔒 已锁定") : QStringLiteral("— 未锁定"));
+            if (role == Qt::DisplayRole) return lockTextOf(id);
             if (role == Qt::TextAlignmentRole) return int(Qt::AlignCenter);
             return QVariant();
         }
@@ -296,27 +436,68 @@ public:
 };
 
 static LockProxy* g_proxy = nullptr;
-static QAbstractItemModel* g_srcModel = nullptr;
 
-static void installColumn() {
+static void applyColumnProxy() {
     if (!g_view) return;
     QAbstractItemModel* src = g_view->model();
     if (!src) return;
-    if (dynamic_cast<LockProxy*>(src)) return;                 // 已是我们的
-    g_srcModel = src;
+    if (g_proxy && src == g_proxy) return;
+    if (dynamic_cast<LockProxy*>(src)) return;
     g_proxy = new LockProxy(g_view);
     g_proxy->setSourceModel(src);
-    logf("[column] swapping model %p -> proxy %p (src rows=%d cols=%d)",
-         (void*)src, (void*)g_proxy, src->rowCount(), src->columnCount());
+    QAbstractItemModel* keep = src;
     g_view->setModel(g_proxy);
-    g_view->setColumnWidth(g_proxy->extraCol(), 96);
     if (g_view->model() != g_proxy) {
-        logf("[column] !! swap failed, restoring original model");
-        g_view->setModel(src);
+        logf("[column] !! proxy swap failed, restoring");
+        g_view->setModel(keep);
         delete g_proxy; g_proxy = nullptr;
-    } else {
-        logf("[column] ok, extra col = %d", g_proxy->extraCol());
+        return;
     }
+    g_view->setColumnWidth(g_proxy->extraCol(), 96);
+    logf("[column] proxy-mode ok, extCol=%d", g_proxy->extraCol());
+}
+
+static void applyColumn() {
+    if (!g_cfg.enableColumn || !g_view) return;
+    if (g_cfg.columnMode == QStringLiteral("proxy")) applyColumnProxy();
+    else applyColumnInsert();
+}
+
+// 每拍轻量巡检：模型被换/列被厂商刷掉时自动补回
+static void ensureColumn() {
+    if (!g_cfg.enableColumn || !g_view) return;
+    if (g_cfg.columnMode == QStringLiteral("proxy")) {
+        if (!g_proxy || g_view->model() != g_proxy) {
+            if (!dynamic_cast<LockProxy*>(g_view->model())) applyColumnProxy();
+        }
+        return;
+    }
+    auto* stdm = qobject_cast<QStandardItemModel*>(g_view->model());
+    if (!stdm) return;
+    const bool need =
+        (g_std != stdm) || (g_extCol < 0) || (stdm->columnCount() <= g_extCol) ||
+        (stdm->headerData(g_extCol, Qt::Horizontal, Qt::DisplayRole).toString() != QStringLiteral("保活锁定"));
+    if (need) {
+        logf("[column] ensure -> re-apply (model=%p extCol=%d cols=%d)", (void*)stdm, g_extCol, stdm->columnCount());
+        applyColumnInsert();
+    } else {
+        refreshExtColumn();
+    }
+}
+
+static void refreshColumnNow() {
+    if (!g_cfg.enableColumn) return;
+    if (g_cfg.columnMode == QStringLiteral("proxy")) {
+        if (g_proxy) {
+            const int col = g_proxy->extraCol();
+            if (g_proxy->rowCount() > 0)
+                g_proxy->dataChanged(g_proxy->index(0, col), g_proxy->index(g_proxy->rowCount() - 1, col),
+                                     {Qt::DisplayRole});
+        }
+    } else {
+        refreshExtColumn();
+    }
+    if (g_view) g_view->viewport()->update();
 }
 
 // ---------------------------------------------------------------- 右键菜单 hook（IAT patch）
@@ -354,58 +535,81 @@ static void* patchIat(HMODULE mod, const char* dllName, const char* fnName, void
 typedef QAction* (*ExecFn)(QMenu*, const QPoint&, QAction*);
 static ExecFn g_origExec = nullptr;
 
-static QString currentDevId() {
-    if (!g_view) return QString();
-    QAbstractItemModel* m = g_view->model();
-    if (!m) return QString();
-    const QModelIndex idx = g_view->currentIndex();
-    if (!idx.isValid()) return QString();
-    return cellText(m, idx.row(), g_cols.id);
+// 我们自己加的菜单项统一打这个标记，便于下次先清后加（修 v0.1 累加）
+static const char* kExtMark = "bbext";
+
+static void stripExtActions(QMenu* m) {
+    const QList<QAction*> acts = m->actions();
+    for (QAction* a : acts) {
+        if (a->objectName() == QLatin1String(kExtMark)) {
+            m->removeAction(a);
+            a->deleteLater();
+        }
+    }
 }
 
-static void setLockForCurrent(bool on) {
-    const QString id = currentDevId();
-    if (id.isEmpty()) { logf("[lock] no device selected"); return; }
-    { std::lock_guard<std::mutex> lk(g_devMx);
-      DevState& st = g_dev[id];
-      st.locked = on; st.retries = 0; st.bad = false;
-      if (on) st.lastTrigger = QDateTime::currentMSecsSinceEpoch(); }
-    logf("[lock] %s dev=%s", on ? "LOCK" : "UNLOCK", id.toUtf8().constData());
-    saveState();
-    if (g_view && g_proxy) {
-        const int col = g_proxy->extraCol();
-        g_proxy->dataChanged(g_proxy->index(0, col),
-                             g_proxy->index(g_proxy->rowCount() - 1, col),
-                             {Qt::DisplayRole});
+static int currentRow() {
+    if (!g_view) return -1;
+    const QModelIndex idx = g_view->currentIndex();
+    if (idx.isValid()) return idx.row();
+    if (QItemSelectionModel* sm = g_view->selectionModel()) {
+        const QModelIndex c = sm->currentIndex();
+        if (c.isValid()) return c.row();
     }
-    if (g_view) g_view->viewport()->update();
+    return -1;
+}
+
+static QString rowDevId(int row) {
+    if (row < 0 || !g_view) return QString();
+    return cellText(g_view->model(), row, g_cols.id);
+}
+
+static void setLockForRow(int row, bool on) {
+    const QString id = rowDevId(row);
+    if (id.isEmpty()) { logf("[lock] no device at row=%d", row); return; }
+    {
+        std::lock_guard<std::mutex> lk(g_devMx);
+        DevState& st = g_dev[id];
+        st.locked = on; st.retries = 0; st.bad = false;
+        if (on) st.lastTrigger = QDateTime::currentMSecsSinceEpoch();
+    }
+    logf("[lock] %s dev=%s row=%d", on ? "LOCK" : "UNLOCK", id.toUtf8().constData(), row);
+    saveState();
+    refreshColumnNow();
 }
 
 static QAction* hookExec(QMenu* self, const QPoint& pos, QAction* at) {
-    if (!self) return g_origExec(self, pos, at);
+    if (!self || !g_cfg.enabled) return g_origExec(self, pos, at);
+
     bool isDeviceMenu = false;
-    const QList<QAction*> acts = self->actions();
-    for (QAction* a : acts) {
+    for (QAction* a : self->actions()) {
         const QString t = a->text();
         if (t.contains(QStringLiteral("删除设备")) || t.contains(QStringLiteral("复制设备号")) ||
             t.contains(QStringLiteral("激活授权"))) { isDeviceMenu = true; break; }
     }
     if (!isDeviceMenu) return g_origExec(self, pos, at);
 
+    stripExtActions(self);                       // ★ 关键：先清掉上一次加的，防止累加
+
+    QAction* sep     = self->addSeparator();
     QAction* aDump   = self->addAction(QStringLiteral("[EXT] 自检：导出设备列表"));
     QAction* aLock   = self->addAction(QStringLiteral("[EXT] 🔒 开启保活锁定"));
     QAction* aUnlock = self->addAction(QStringLiteral("[EXT] 🔓 取消保活锁定"));
-    const QString id = currentDevId();
+    for (QAction* a : {sep, aDump, aLock, aUnlock}) a->setObjectName(QLatin1String(kExtMark));
+
+    const int row = currentRow();
+    const QString id = rowDevId(row);
     bool locked = false;
     { std::lock_guard<std::mutex> lk(g_devMx); locked = g_dev.value(id).locked; }
     aLock->setEnabled(!locked);
     aUnlock->setEnabled(locked);
-    logf("[menu] device menu on dev=%s locked=%d", id.toUtf8().constData(), (int)locked);
+    logf("[menu] device menu row=%d dev=%s locked=%d (menu items now=%d)",
+         row, id.toUtf8().constData(), (int)locked, (int)self->actions().size());
 
     QAction* hit = g_origExec(self, pos, at);
-    if (hit == aDump)   dumpList("menu");
-    else if (hit == aLock)   setLockForCurrent(true);
-    else if (hit == aUnlock) setLockForCurrent(false);
+    if (hit == aDump)        dumpList("menu");
+    else if (hit == aLock)   setLockForRow(row, true);
+    else if (hit == aUnlock) setLockForRow(row, false);
     return hit;
 }
 
@@ -433,7 +637,6 @@ static void triggerRun(int row) {
     g_view->selectRow(row);
 
     if (g_cfg.route == QStringLiteral("p2")) {
-        // 直调厂家的 onRunScript 槽（在 deviceView 的祖先里找）
         QObject* owner = g_win;
         if (owner) {
             bool ok = QMetaObject::invokeMethod(owner, "onRunScript", Qt::DirectConnection);
@@ -454,53 +657,71 @@ static void triggerRun(int row) {
 
 static qint64 g_lastSweep = 0;
 
-static void tick() {
-    if (g_win && !g_view) locateWidgets();
-    if (g_cfg.enableColumn && g_view && g_proxy && g_view->model() != g_proxy) {
-        logf("[column] model was replaced by app -> re-installing");
-        installColumn();
-    }
-    if (!g_cfg.enabled) return;
-
-    qint64 now = QDateTime::currentMSecsSinceEpoch();
-    if (now - g_lastSweep < g_cfg.sweepMs) return;
-    g_lastSweep = now;
-
+static void sweep() {
     if (!g_view) return;
     QAbstractItemModel* m = g_view->model();
     if (!m) return;
     g_cols = locateColumns(m);
-    if (g_cols.run < 0 || g_cols.id < 0) return;
+    if (g_cols.run < 0 || g_cols.id < 0) {
+        logf("[watch] !! 列定位失败 (id=%d run=%d)，跳过本轮", g_cols.id, g_cols.run);
+        return;
+    }
 
-    std::lock_guard<std::mutex> lk(g_devMx);
-    for (auto it = g_dev.begin(); it != g_dev.end(); ++it) {
-        if (!it->locked) continue;
-        const QString id = it.key();
-        const int row = rowOfDevId(m, g_cols.id, id);
-        if (row < 0) { continue; }
-        const QString run  = cellText(m, row, g_cols.run);
-        const QString conn = cellText(m, row, g_cols.conn);
-        const QString auth = cellText(m, row, g_cols.auth);
-        if (!run.contains(QStringLiteral("运行"))) {           // 空闲/其他 => 未运行
-            if (g_cols.conn >= 0 && !conn.contains(QStringLiteral("已连接"))) continue;
-            if (g_cols.auth >= 0 && !auth.contains(QStringLiteral("已授权"))) continue;
-            if (now - it->lastTrigger < g_cfg.cooldownMs) continue;
-            if (it->retries >= g_cfg.maxRetry) {
-                if (!it->bad) { it->bad = true; logf("[watch] dev=%s 连续 %d 次未起，标红停手",
-                                                     id.toUtf8().constData(), it->retries); }
+    struct Job { QString id; int row; int retry; };
+    QList<Job> jobs;
+    bool changed = false;
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+
+    {
+        std::lock_guard<std::mutex> lk(g_devMx);
+        for (auto it = g_dev.begin(); it != g_dev.end(); ++it) {
+            if (!it->locked || it->bad) continue;
+            const QString id = it.key();
+            const int row = rowOfDevId(m, g_cols.id, id);
+            if (row < 0) continue;
+            const QString run = cellText(m, row, g_cols.run);
+
+            if (looksRunning(run)) {
+                if (it->retries != 0) {
+                    it->retries = 0; changed = true;
+                    logf("[watch] dev=%s 已恢复运行", id.toUtf8().constData());
+                }
                 continue;
             }
-            logf("[watch] dev=%s 状态=%s 未运行 -> 触发 (retry=%d)", id.toUtf8().constData(),
-                 run.toUtf8().constData(), it->retries);
-            it->lastTrigger = now; it->retries++;
-            triggerRun(row);
-        } else {
-            if (it->retries != 0 || it->bad) {
-                it->retries = 0; it->bad = false;
-                logf("[watch] dev=%s 已恢复运行", id.toUtf8().constData());
+            if (g_cfg.requireConn && g_cols.conn >= 0 &&
+                !cellText(m, row, g_cols.conn).contains(QStringLiteral("已连接"))) continue;
+            if (g_cfg.requireAuth && g_cols.auth >= 0 &&
+                !cellText(m, row, g_cols.auth).contains(QStringLiteral("已授权"))) continue;
+            if (now - it->lastTrigger < g_cfg.cooldownMs) continue;
+
+            if (it->retries >= g_cfg.maxRetry) {
+                it->bad = true; changed = true;
+                logf("[watch] dev=%s 连续 %d 次未起 -> 标红停手", id.toUtf8().constData(), it->retries);
+                continue;
             }
+            it->lastTrigger = now;
+            it->retries++;
+            changed = true;
+            jobs.append({id, row, it->retries});
+            logf("[watch] dev=%s 状态='%s' 未运行 -> 触发 (retry=%d)",
+                 id.toUtf8().constData(), run.toUtf8().constData(), it->retries);
         }
     }
+
+    for (const Job& j : jobs) triggerRun(j.row);
+    if (changed) saveState();
+    refreshExtColumn();
+}
+
+static void tick() {
+    if (g_win && !g_view) locateWidgets();
+    ensureColumn();                      // ★ 必须在取 g_devMx 之前（内部会读锁定态）
+    if (!g_cfg.enabled) return;
+
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (now - g_lastSweep < g_cfg.sweepMs) return;
+    g_lastSweep = now;
+    sweep();
 }
 
 // ---------------------------------------------------------------- 主线程装配
@@ -508,11 +729,11 @@ static void tick() {
 static void extSetup() {
     ++g_setupDone;
     locateWidgets();
-    locateColumns(g_view ? g_view->model() : nullptr);
     g_cols = locateColumns(g_view ? g_view->model() : nullptr);
     installMenuHook();
     dumpList("init");
-    if (g_cfg.enableColumn) installColumn();
+    if (g_cfg.enableColumn) applyColumn();
+    else logf("[column] disabled (enable_column=0)");
 
     QTimer* t = new QTimer(QCoreApplication::instance());
     QObject::connect(t, &QTimer::timeout, QCoreApplication::instance(), [] { tick(); });

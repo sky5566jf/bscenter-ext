@@ -3,3 +3,5 @@ out/
 *.log
 *.user
 .vs/
+_lintsrc.py
+_dl/
