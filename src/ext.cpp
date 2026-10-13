@@ -84,15 +84,29 @@ struct Config {
     bool enabled = true;
     bool dryRun = true;
     bool enableColumn = true;              // v0.2: 默认开
-    bool useCheck = true;
+    bool useCheck = false;                 // v0.3: 默认不碰勾选列（避免误影响其他设备）
     bool requireConn = true;
     bool requireAuth = true;
+    bool confirmByButtons = true;          // v0.3: 动手前用 runButton/stopButton 状态二次确认
+    bool unknownIsRunning = true;          // v0.3: 运行态认不出时按「在跑」处理（不乱点，保守）
     int  sweepMs = 10000;
     int  cooldownMs = 90000;
     int  maxRetry = 5;
     QString route = QStringLiteral("p1");
     QString columnMode = QStringLiteral("insert");   // insert | proxy
+    QString runningWords;                  // 「在跑」关键字（逗号分隔）
+    QString idleMarkers;                   // 「不在跑」关键字（逗号分隔）
 } g_cfg;
+
+static QList<QString> splitWords(const QString& s) {
+    QList<QString> out;
+    for (const QString& p : s.split(QLatin1Char(','), Qt::SkipEmptyParts)) {
+        const QString t = p.trimmed();
+        if (!t.isEmpty()) out << t;
+    }
+    return out;
+}
+static QList<QString> g_runningWords, g_idleMarkers;
 
 static void loadConfig() {
     const QString ini = qFileInDir(L"bbcenter_ext.ini");
@@ -107,31 +121,46 @@ static void loadConfig() {
                     "sweep_ms=10000\n"
                     "cooldown_ms=90000\n"
                     "max_retry=5\n"
-                    "use_check=1\n"
+                    "use_check=0\n"
                     "require_conn=1\n"
                     "require_auth=1\n"
+                    "confirm_by_buttons=1\n"
+                    "unknown_is_running=1\n"
+                    "running_words=运行,播放,投屏,启动,工作中,已开,开始\n"
+                    "idle_markers=未,停止,关闭,失败,断开,无,空闲,空,不在线\n"
                     "trigger_route=p1\n");
             f.close();
         }
     }
     QSettings s(ini, QSettings::IniFormat);
-    g_cfg.enabled      = s.value("ext/enabled", 1).toInt() != 0;
-    g_cfg.dryRun       = s.value("ext/dry_run", 1).toInt() != 0;
-    g_cfg.enableColumn = s.value("ext/enable_column", 1).toInt() != 0;
-    g_cfg.useCheck     = s.value("ext/use_check", 1).toInt() != 0;
-    g_cfg.requireConn  = s.value("ext/require_conn", 1).toInt() != 0;
-    g_cfg.requireAuth  = s.value("ext/require_auth", 1).toInt() != 0;
-    g_cfg.sweepMs      = s.value("ext/sweep_ms", 10000).toInt();
-    g_cfg.cooldownMs   = s.value("ext/cooldown_ms", 90000).toInt();
-    g_cfg.maxRetry     = s.value("ext/max_retry", 5).toInt();
-    g_cfg.route        = s.value("ext/trigger_route", "p1").toString();
-    g_cfg.columnMode   = s.value("ext/column_mode", "insert").toString().trimmed().toLower();
+    g_cfg.enabled          = s.value("ext/enabled", 1).toInt() != 0;
+    g_cfg.dryRun           = s.value("ext/dry_run", 1).toInt() != 0;
+    g_cfg.enableColumn     = s.value("ext/enable_column", 1).toInt() != 0;
+    g_cfg.useCheck         = s.value("ext/use_check", 0).toInt() != 0;
+    g_cfg.requireConn      = s.value("ext/require_conn", 1).toInt() != 0;
+    g_cfg.requireAuth      = s.value("ext/require_auth", 1).toInt() != 0;
+    g_cfg.confirmByButtons = s.value("ext/confirm_by_buttons", 1).toInt() != 0;
+    g_cfg.unknownIsRunning = s.value("ext/unknown_is_running", 1).toInt() != 0;
+    g_cfg.sweepMs          = s.value("ext/sweep_ms", 10000).toInt();
+    g_cfg.cooldownMs       = s.value("ext/cooldown_ms", 90000).toInt();
+    g_cfg.maxRetry         = s.value("ext/max_retry", 5).toInt();
+    g_cfg.route            = s.value("ext/trigger_route", "p1").toString();
+    g_cfg.columnMode       = s.value("ext/column_mode", "insert").toString().trimmed().toLower();
     if (g_cfg.columnMode != QStringLiteral("proxy")) g_cfg.columnMode = QStringLiteral("insert");
-    logf("[cfg] enabled=%d dry_run=%d enable_column=%d column_mode=%s sweep=%dms cooldown=%dms max_retry=%d route=%s conn=%d auth=%d",
+    g_cfg.runningWords     = s.value("ext/running_words", "运行,播放,投屏,启动,工作中,已开,开始").toString();
+    g_cfg.idleMarkers      = s.value("ext/idle_markers", "未,停止,关闭,失败,断开,无,空闲,空,不在线").toString();
+    g_runningWords = splitWords(g_cfg.runningWords);
+    g_idleMarkers  = splitWords(g_cfg.idleMarkers);
+    logf("[cfg] enabled=%d dry_run=%d enable_column=%d column_mode=%s sweep=%dms cooldown=%dms max_retry=%d route=%s",
          (int)g_cfg.enabled, (int)g_cfg.dryRun, (int)g_cfg.enableColumn,
          g_cfg.columnMode.toUtf8().constData(),
-         g_cfg.sweepMs, g_cfg.cooldownMs, g_cfg.maxRetry, g_cfg.route.toUtf8().constData(),
-         (int)g_cfg.requireConn, (int)g_cfg.requireAuth);
+         g_cfg.sweepMs, g_cfg.cooldownMs, g_cfg.maxRetry, g_cfg.route.toUtf8().constData());
+    logf("[cfg] use_check=%d conn=%d auth=%d confirm_by_buttons=%d unknown_is_running=%d",
+         (int)g_cfg.useCheck, (int)g_cfg.requireConn, (int)g_cfg.requireAuth,
+         (int)g_cfg.confirmByButtons, (int)g_cfg.unknownIsRunning);
+    QString rw; for (const QString& w : g_runningWords) rw += w + QLatin1Char('|');
+    QString iw; for (const QString& w : g_idleMarkers) iw += w + QLatin1Char('|');
+    logf("[cfg] running_words=%s idle_markers=%s", rw.toUtf8().constData(), iw.toUtf8().constData());
 }
 
 // ---------------------------------------------------------------- 锁定状态
@@ -280,23 +309,19 @@ static void dumpList(const char* why) {
 }
 
 // ---------------------------------------------------------------- 运行态判定
-
-static bool looksRunning(const QString& s) {
-    const QString t = s.trimmed();
+// 「脚本在运行吗」——先看「不在跑」标记，再看「在跑」关键字，最后兜底。
+// 兜底默认按「在跑」处理：认不出来时宁可不点，绝不乱点（unknown_is_running=1）。
+static bool looksRunning(const QString& raw) {
+    const QString t = raw.trimmed();
     if (t.isEmpty()) return false;
-    if (t == QStringLiteral("--") || t == QStringLiteral("-") || t == QStringLiteral("—")) return false;
-    static const QStringList neg = {
-        QStringLiteral("未"), QStringLiteral("停止"), QStringLiteral("关闭"),
-        QStringLiteral("失败"), QStringLiteral("断开"), QStringLiteral("无"),
-        QStringLiteral("不")
+    static const QStringList kDash = {
+        QStringLiteral("-"), QStringLiteral("--"), QStringLiteral("---"),
+        QStringLiteral("—"), QStringLiteral("——"), QStringLiteral("－")
     };
-    for (const QString& n : neg) if (t.contains(n)) return false;
-    static const QStringList pos = {
-        QStringLiteral("运行"), QStringLiteral("播放"), QStringLiteral("投屏"),
-        QStringLiteral("启动"), QStringLiteral("已开")
-    };
-    for (const QString& p : pos) if (t.contains(p)) return true;
-    return false;
+    if (kDash.contains(t)) return false;
+    for (const QString& w : g_idleMarkers)  if (t.contains(w)) return false;
+    for (const QString& w : g_runningWords) if (t.contains(w)) return true;
+    return g_cfg.unknownIsRunning;
 }
 
 // ---------------------------------------------------------------- 锁定态文本
@@ -324,6 +349,7 @@ static bool g_inRefresh = false;
 static QStyledItemDelegate* g_extDelegate = nullptr;
 
 static void applyColumn();          // fwd
+static void dumpButtons(const char* why);   // fwd
 
 static void refreshExtColumn() {
     if (g_inRefresh) return;
@@ -607,7 +633,7 @@ static QAction* hookExec(QMenu* self, const QPoint& pos, QAction* at) {
          row, id.toUtf8().constData(), (int)locked, (int)self->actions().size());
 
     QAction* hit = g_origExec(self, pos, at);
-    if (hit == aDump)        dumpList("menu");
+    if (hit == aDump) { dumpList("menu"); dumpButtons("menu"); dumpStatus("menu"); }
     else if (hit == aLock)   setLockForRow(row, true);
     else if (hit == aUnlock) setLockForRow(row, false);
     return hit;
@@ -621,41 +647,139 @@ static void installMenuHook() {
     else      { logf("[hook] !! QMenu::exec IAT not found — 右键菜单功能不可用"); }
 }
 
-// ---------------------------------------------------------------- 触发运行
+// ---------------------------------------------------------------- 按钮（中控权威状态来源）
 
-static void triggerRun(int row) {
-    if (!g_view) return;
+static QAbstractButton* findButton(const QString& name) {
+    if (g_win) if (auto* b = g_win->findChild<QAbstractButton*>(name)) return b;
+    if (QWidget* w = findByName(name)) return qobject_cast<QAbstractButton*>(w);
+    return nullptr;
+}
+
+// 一次性把主窗口所有按钮名/文本/可用状态打进日志 —— 确认 runButton/stopButton 就位
+static void dumpButtons(const char* why) {
+    if (!g_win) { logf("[btn:%s] no main window", why); return; }
+    const QList<QAbstractButton*> bs = g_win->findChildren<QAbstractButton*>();
+    logf("[btn:%s] total=%d", why, (int)bs.size());
+    for (QAbstractButton* b : bs) {
+        logf("[btn:%s] name='%s' text='%s' enabled=%d visible=%d class=%s", why,
+             b->objectName().toUtf8().constData(), b->text().toUtf8().constData(),
+             (int)b->isEnabled(), (int)b->isVisible(), b->metaObject()->className());
+    }
+}
+
+// ---------------------------------------------------------------- 触发运行
+// 目标 = 与人工操作等价：选中该设备行 -> 点中控工具栏「运行」。
+// v0.3：动手前用 stopButton/runButton 的可用状态做二次确认（中控自己的权威判定）：
+//   · 选中后 stopButton 可用  -> 设备正在跑，不需要点
+//   · 选中后 runButton 不可用 -> 设备当前不可运行（离线/未授权），本轮跳过
+// 返回 true = 已达成「在跑」或成功触发（重置重试计数）；false = 软失败。
+static QAbstractButton* g_runBtn = nullptr;
+static QAbstractButton* g_stopBtn = nullptr;
+
+static bool triggerRun(int row, const char* why) {
+    if (!g_view) return false;
     QAbstractItemModel* m = g_view->model();
     const QString id = cellText(m, row, g_cols.id);
-    if (g_cfg.dryRun) { logf("[watch] DRY would trigger run row=%d dev=%s", row, id.toUtf8().constData()); return; }
+    if (g_cfg.dryRun) {
+        logf("[watch] DRY would trigger run row=%d dev=%s (%s)", row, id.toUtf8().constData(), why);
+        return true;
+    }
 
+    if (!g_runBtn)  g_runBtn  = findButton(QStringLiteral("runButton"));
+    if (!g_stopBtn) g_stopBtn = findButton(QStringLiteral("stopButton"));
+
+    // 透明度保护：若中控的「运行」是「批量作用于勾选行」的语义，别的设备会被一起启动。
+    int checkedOthers = 0;
+    for (int r = 0, n = m->rowCount(); r < n; ++r) {
+        if (r == row) continue;
+        const QModelIndex ci = m->index(r, 0);
+        if ((m->flags(ci) & Qt::ItemIsUserCheckable) &&
+            m->data(ci, Qt::CheckStateRole).toInt() == Qt::Checked)
+            ++checkedOthers;
+    }
+    if (checkedOthers > 0)
+        logf("[watch] WARN 另有 %d 行处于勾选状态；若中控「运行」作用于勾选行，它们会被一并启动",
+             checkedOthers);
+
+    g_view->selectRow(row);                       // 等价人工点中这一行
     if (g_cfg.useCheck) {
         const QModelIndex ci = m->index(row, 0);
         if (m->flags(ci) & Qt::ItemIsUserCheckable)
             m->setData(ci, Qt::Checked, Qt::CheckStateRole);
     }
-    g_view->selectRow(row);
+
+    if (g_cfg.confirmByButtons) {
+        if (g_stopBtn && g_stopBtn->isEnabled()) {
+            logf("[watch] dev=%s 选中后 stopButton=可用 -> 判定在跑，不点", id.toUtf8().constData());
+            return true;
+        }
+        if (g_runBtn && !g_runBtn->isEnabled()) {
+            logf("[watch] dev=%s 选中后 runButton=不可用 -> 设备不可运行，跳过", id.toUtf8().constData());
+            return false;
+        }
+    }
 
     if (g_cfg.route == QStringLiteral("p2")) {
         QObject* owner = g_win;
         if (owner) {
-            bool ok = QMetaObject::invokeMethod(owner, "onRunScript", Qt::DirectConnection);
-            logf("[watch] invoke onRunScript -> %d", (int)ok);
+            bool ok = QMetaObject::invokeMethod(owner, "on_runButton_clicked", Qt::DirectConnection);
+            if (!ok) ok = QMetaObject::invokeMethod(owner, "onRunScript", Qt::DirectConnection);
+            logf("[watch] invoke on_runButton_clicked/onRunScript -> %d (row=%d dev=%s)", (int)ok, row,
+                 id.toUtf8().constData());
+            return ok;
         }
-        return;
+        return false;
     }
-    QWidget* rb = findByName(QStringLiteral("runButton"));
-    if (auto* b = qobject_cast<QAbstractButton*>(rb)) {
-        b->click();
-        logf("[watch] clicked runButton (row=%d dev=%s)", row, id.toUtf8().constData());
-    } else {
-        logf("[watch] !! runButton not found");
-    }
+
+    if (!g_runBtn) { logf("[watch] !! runButton not found（见 [btn:*] 日志），why=%s", why); return false; }
+    g_runBtn->click();
+    logf("[watch] clicked runButton (row=%d dev=%s, stopEnabled=%d, why=%s)",
+         row, id.toUtf8().constData(), (int)(g_stopBtn ? g_stopBtn->isEnabled() : -1), why);
+    return true;
 }
 
 // ---------------------------------------------------------------- 看门狗
 
 static qint64 g_lastSweep = 0;
+static QHash<QString, QString> g_lastRun;        // devId -> 上一次看到的「运行」列原文（主线程私有）
+
+// 一次性快照：每行「运行」列原文 + 我们的判定 —— 用于核对判定是否与中控一致
+static void dumpStatus(const char* why) {
+    if (!g_view) return;
+    QAbstractItemModel* m = g_view->model();
+    if (!m) return;
+    const Cols c = locateColumns(m);
+    logf("[stat:%s] rows=%d idCol=%d runCol=%d connCol=%d authCol=%d", why, m->rowCount(),
+         c.id, c.run, c.conn, c.auth);
+    for (int r = 0, n = m->rowCount(); r < n; ++r) {
+        const QString run = cellText(m, r, c.run);
+        logf("[stat:%s] row%d dev=%s 运行原文='%s' 判定=%s 连接='%s' 授权='%s'", why, r,
+             cellText(m, r, c.id).toUtf8().constData(), run.toUtf8().constData(),
+             looksRunning(run) ? "在跑" : "不在跑",
+             cellText(m, r, c.conn).toUtf8().constData(),
+             cellText(m, r, c.auth).toUtf8().constData());
+    }
+}
+
+// 运行态变化留痕：抓真实文本，用于校准 running_words/idle_markers
+static void logStatusChanges(QAbstractItemModel* m) {
+    if (!m || g_cols.run < 0 || g_cols.id < 0) return;
+    for (int r = 0, n = m->rowCount(); r < n; ++r) {
+        const QString id = cellText(m, r, g_cols.id);
+        if (id.isEmpty()) continue;
+        const QString st = cellText(m, r, g_cols.run);
+        auto it = g_lastRun.find(id);
+        if (it == g_lastRun.end()) { g_lastRun[id] = st; continue; }
+        if (it.value() == st) continue;
+        const QString old = it.value();
+        it.value() = st;
+        logf("[status] dev=%s 运行 '%s' -> '%s'  判定=%s | 连接='%s' 授权='%s'",
+             id.toUtf8().constData(), old.toUtf8().constData(), st.toUtf8().constData(),
+             looksRunning(st) ? "在跑" : "不在跑",
+             cellText(m, r, g_cols.conn).toUtf8().constData(),
+             cellText(m, r, g_cols.auth).toUtf8().constData());
+    }
+}
 
 static void sweep() {
     if (!g_view) return;
@@ -666,8 +790,9 @@ static void sweep() {
         logf("[watch] !! 列定位失败 (id=%d run=%d)，跳过本轮", g_cols.id, g_cols.run);
         return;
     }
+    logStatusChanges(m);
 
-    struct Job { QString id; int row; int retry; };
+    struct Job { QString id; int row; const char* why; };
     QList<Job> jobs;
     bool changed = false;
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
@@ -702,13 +827,20 @@ static void sweep() {
             it->lastTrigger = now;
             it->retries++;
             changed = true;
-            jobs.append({id, row, it->retries});
-            logf("[watch] dev=%s 状态='%s' 未运行 -> 触发 (retry=%d)",
+            jobs.append({id, row, "运行列为空/非运行态"});
+            logf("[watch] dev=%s 运行列原文='%s' -> 判定未运行，准备触发 (retry=%d)",
                  id.toUtf8().constData(), run.toUtf8().constData(), it->retries);
         }
     }
 
-    for (const Job& j : jobs) triggerRun(j.row);
+    for (const Job& j : jobs) {
+        if (triggerRun(j.row, j.why)) {
+            std::lock_guard<std::mutex> lk(g_devMx);
+            auto it = g_dev.find(j.id);
+            if (it != g_dev.end()) it->retries = 0;      // 已达成 / 已触发：不累计失败
+            changed = true;
+        }
+    }
     if (changed) saveState();
     refreshExtColumn();
 }
@@ -732,6 +864,8 @@ static void extSetup() {
     g_cols = locateColumns(g_view ? g_view->model() : nullptr);
     installMenuHook();
     dumpList("init");
+    dumpButtons("init");
+    dumpStatus("init");
     if (g_cfg.enableColumn) applyColumn();
     else logf("[column] disabled (enable_column=0)");
 

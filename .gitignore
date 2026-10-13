@@ -4,4 +4,5 @@ out/
 *.user
 .vs/
 _lintsrc.py
+_probe_*.py
 _dl/
