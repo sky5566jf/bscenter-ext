@@ -41,6 +41,7 @@
 #include <QMenu>
 #include <QAction>
 #include <QTimer>
+#include <QMouseEvent>
 #include <QMetaObject>
 #include <QMetaMethod>
 #include <QString>
@@ -769,6 +770,45 @@ static void uncheckLater(QAbstractItemModel* m, int row, const QString& id) {
     });
 }
 
+// ---------------------------------------------------------------- 合成真实鼠标事件
+// p1/p2 实测教训：invoke on_runButton_clicked 成功(->1) 但脚本不起 —— 厂商内部不看
+// selectRow/setData 写的状态，走自己的鼠标事件驱动状态机。
+// p3 = 把真实 QMouseEvent 投给厂商 viewport，走它真实的 delegate/selection/勾选链路，
+// 与人工点击在事件层面完全一致。
+
+static bool synthClick(QTableView* v, const QModelIndex& ix, const char* tag) {
+    if (!v || !ix.isValid()) return false;
+    const QRect r = v->visualRect(ix);
+    if (r.isEmpty()) {
+        logf("[click] %s visualRect EMPTY row=%d col=%d（可能不在可视区）", tag, ix.row(), ix.column());
+        return false;
+    }
+    QWidget* vp = v->viewport();
+    const QPoint p = r.center();
+    const QPointF gp = vp->mapToGlobal(p);
+    QMouseEvent press(QEvent::MouseButtonPress, QPointF(p), gp,
+                      Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+    QMouseEvent release(QEvent::MouseButtonRelease, QPointF(p), gp,
+                        Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+    QApplication::sendEvent(vp, &press);
+    QApplication::sendEvent(vp, &release);
+    logf("[click] %s row=%d col=%d at=(%d,%d)", tag, ix.row(), ix.column(), p.x(), p.y());
+    return true;
+}
+
+static void uncheckLaterClick(const QString& id) {
+    QTimer::singleShot(2000, QCoreApplication::instance(), [id] {
+        if (!g_view) return;
+        QAbstractItemModel* mm = g_view->model();
+        int r = rowOfDevId(mm, g_cols.id, id);
+        if (r < 0) { logf("[watch] uncheck: dev=%s 行未找到", id.toUtf8().constData()); return; }
+        const QModelIndex ck = mm->index(r, 0);
+        if (ck.isValid() && mm->data(ck, Qt::CheckStateRole).toInt() == Qt::Checked)
+            synthClick(g_view, ck, "uncheck");
+        logf("[watch] 触发完成，已取消勾选 dev=%s", id.toUtf8().constData());
+    });
+}
+
 static bool triggerRun(int row, const char* why) {
     if (!g_view) return false;
     QAbstractItemModel* m = g_view->model();
@@ -801,14 +841,51 @@ static bool triggerRun(int row, const char* why) {
             m->setData(ci, Qt::Checked, Qt::CheckStateRole);
     }
 
+    const bool p3 = (g_cfg.route == QStringLiteral("p3"));
+    if (p3) {
+        // 1) 真实事件选中该行（点设备号列）
+        const int selCol = (g_cols.id >= 0) ? g_cols.id : 0;
+        synthClick(g_view, m->index(row, selCol), "select");
+        logf("[click] selection: current=%d hasSel=%d",
+             g_view->selectionModel()->currentIndex().row(),
+             (int)g_view->selectionModel()->hasSelection());
+        // 2) 真实事件勾选该行（点第 0 列勾选框，勾选状态翻转 = 厂商状态机真实吸收）
+        bool checkedNow = false;
+        if (g_cfg.useCheck) {
+            const QModelIndex ckIx = m->index(row, 0);
+            const int before = m->data(ckIx, Qt::CheckStateRole).toInt();
+            synthClick(g_view, ckIx, "check");
+            const int after = m->data(ckIx, Qt::CheckStateRole).toInt();
+            checkedNow = (after == Qt::Checked);
+            logf("[click] check row=%d before=%d after=%d（0->2=勾上）", row, before, after);
+        }
+        // 3) 触发运行：槽松散调用，失败再点 runButton
+        if (g_cfg.confirmByButtons && g_stopBtn && g_stopBtn->isEnabled()) {
+            logf("[watch] dev=%s stopButton=可用 -> 判定在跑，不点", id.toUtf8().constData());
+            return true;
+        }
+        bool ok = false; QString where;
+        QObject* owner = g_win;
+        if (owner) ok = invokeSlotLoose(owner, "on_runButton_clicked", where);
+        if (!ok) for (QWidget* w : QApplication::allWidgets()) {
+            ok = invokeSlotLoose(w, "on_runButton_clicked", where); if (ok) break;
+        }
+        if (!ok) ok = invokeDeep(QCoreApplication::instance(), "on_runButton_clicked", where);
+        if (!ok && g_runBtn) { g_runBtn->click(); where = QStringLiteral("runButton->click()"); ok = true; }
+        if (ok && checkedNow) uncheckLaterClick(id);
+        logf("[watch] p3 real-click flow -> %d (%s) row=%d dev=%s",
+             (int)ok, where.toUtf8().constData(), row, id.toUtf8().constData());
+        return ok;
+    }
+
     const bool p2 = (g_cfg.route == QStringLiteral("p2"));
     if (g_cfg.confirmByButtons) {
         if (g_stopBtn && g_stopBtn->isEnabled()) {
             logf("[watch] dev=%s 选中后 stopButton=可用 -> 判定在跑，不点", id.toUtf8().constData());
             return true;
         }
-        // p2 直调槽函数，不受按钮禁用状态限制 —— 只在 p1（模拟点击）时检查
-        if (!p2 && g_runBtn && !g_runBtn->isEnabled()) {
+        // p2/p3 不受按钮禁用状态限制 —— 仅 p1（纯模拟点击按钮）时检查
+        if (!p2 && !p3 && g_runBtn && !g_runBtn->isEnabled()) {
             logf("[watch] dev=%s 选中后 runButton=不可用 -> 设备不可运行，跳过", id.toUtf8().constData());
             return false;
         }
