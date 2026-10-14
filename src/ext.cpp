@@ -607,11 +607,27 @@ static void setLockForRow(int row, bool on) {
         std::lock_guard<std::mutex> lk(g_devMx);
         DevState& st = g_dev[id];
         st.locked = on; st.retries = 0; st.bad = false;
-        if (on) st.lastTrigger = QDateTime::currentMSecsSinceEpoch();
+        // ★ 锁定时 lastTrigger=0：下一次 sweep（≤10s）立即触发，不等 90s 冷却
+        if (on) st.lastTrigger = 0;
     }
     logf("[lock] %s dev=%s row=%d", on ? "LOCK" : "UNLOCK", id.toUtf8().constData(), row);
     saveState();
     refreshColumnNow();
+}
+
+// 批量目标行 = 所有勾选行 ∪ 当前右键行（勾选了多台就一起锁/解锁）
+static QList<int> batchRows(int cur) {
+    QList<int> rows;
+    QAbstractItemModel* m = g_view ? g_view->model() : nullptr;
+    if (!m) { if (cur >= 0) rows << cur; return rows; }
+    for (int r = 0; r < m->rowCount(); ++r) {
+        const QModelIndex ci = m->index(r, 0);
+        if ((m->flags(ci) & Qt::ItemIsUserCheckable) &&
+            m->data(ci, Qt::CheckStateRole).toInt() == Qt::Checked)
+            rows << r;
+    }
+    if (cur >= 0 && !rows.contains(cur)) rows << cur;
+    return rows;
 }
 
 static QAction* hookExec(QMenu* self, const QPoint& pos, QAction* at) {
@@ -628,10 +644,9 @@ static QAction* hookExec(QMenu* self, const QPoint& pos, QAction* at) {
     stripExtActions(self);                       // ★ 关键：先清掉上一次加的，防止累加
 
     QAction* sep     = self->addSeparator();
-    QAction* aDump   = self->addAction(QStringLiteral("[EXT] 自检：导出设备列表"));
-    QAction* aLock   = self->addAction(QStringLiteral("[EXT] 🔒 开启锁定"));
-    QAction* aUnlock = self->addAction(QStringLiteral("[EXT] 🔓 取消锁定"));
-    for (QAction* a : {sep, aDump, aLock, aUnlock}) a->setObjectName(QLatin1String(kExtMark));
+    QAction* aLock   = self->addAction(QStringLiteral("🔒 锁定"));
+    QAction* aUnlock = self->addAction(QStringLiteral("🔓 解锁"));
+    for (QAction* a : {sep, aLock, aUnlock}) a->setObjectName(QLatin1String(kExtMark));
 
     const int row = currentRow();
     const QString id = rowDevId(row);
@@ -643,9 +658,16 @@ static QAction* hookExec(QMenu* self, const QPoint& pos, QAction* at) {
          row, id.toUtf8().constData(), (int)locked, (int)self->actions().size());
 
     QAction* hit = g_origExec(self, pos, at);
-    if (hit == aDump) { dumpList("menu"); dumpButtons("menu"); dumpStatus("menu"); }
-    else if (hit == aLock)   setLockForRow(row, true);
-    else if (hit == aUnlock) setLockForRow(row, false);
+    if (hit == aLock) {
+        const QList<int> rows = batchRows(row);
+        for (int r : rows) setLockForRow(r, true);
+        if (rows.size() > 1) logf("[lock] 批量锁定 %d 行", rows.size());
+    }
+    else if (hit == aUnlock) {
+        const QList<int> rows = batchRows(row);
+        for (int r : rows) setLockForRow(r, false);
+        if (rows.size() > 1) logf("[lock] 批量解锁 %d 行", rows.size());
+    }
     return hit;
 }
 
