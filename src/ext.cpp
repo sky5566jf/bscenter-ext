@@ -1017,33 +1017,15 @@ static int WINAPI hookSendTo(SockT s, const char* buf, int len, int flags,
 }
 
 static void patchAllModulesIat(const char* fnName, void* hook, void** origOut) {
-    // ★ v0.12 根因修复：BBCenter.exe 对 ws2_32 是【按序号(ordinal)】导入（导入表只有
-    //   "WS2_32.dll" 一个字符串、零函数名字符串）——旧 patchIat 遇序号项直接 continue，
-    //   中控自己的设备协议 socket 从未被 hook → 0 帧根因之二（叠加异步 IO_PENDING）。
-    //   这里先从 ws2_32 导出表解析目标函数序号，序号项同名同补。
-    static QHash<QString, WORD> ordCache;
-    WORD ord = 0;
-    if (!ordCache.contains(QString::fromLatin1(fnName))) {
-        HMODULE ws2 = GetModuleHandleW(L"ws2_32.dll");
-        if (ws2) {
-            auto dos = (PIMAGE_DOS_HEADER)ws2;
-            auto nt = (PIMAGE_NT_HEADERS)((BYTE*)ws2 + dos->e_lfanew);
-            const auto& ed = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
-            if (ed.VirtualAddress) {
-                auto exp = (PIMAGE_EXPORT_DIRECTORY)((BYTE*)ws2 + ed.VirtualAddress);
-                auto names = (DWORD*)((BYTE*)ws2 + exp->AddressOfNames);
-                auto ords  = (WORD*)((BYTE*)ws2 + exp->AddressOfNameOrdinals);
-                for (DWORD i = 0; i < exp->NumberOfNames; ++i) {
-                    if (_stricmp((const char*)((BYTE*)ws2 + names[i]), fnName) == 0) {
-                        ordCache[QString::fromLatin1(fnName)] = (WORD)(exp->Base + ords[i]);
-                        break;
-                    }
-                }
-            }
-        }
-        if (!ordCache.contains(QString::fromLatin1(fnName))) ordCache[QString::fromLatin1(fnName)] = 0;
-    }
-    ord = ordCache.value(QString::fromLatin1(fnName), 0);
+    // ★ v0.13 根因修复（值匹配法）：BBCenter.exe 明明按名字 import 了 send/recv 等于
+    //   WS2_32.dll（pefile 实锤：bind/closesocket/getpeername/send/socket/accept...），
+    //   但旧 hint-name 匹配在运行时对 BBCenter.exe 就是匹配不到（send=0 顽固复现）。
+    //   改为【值匹配】：GetProcAddress 拿目标函数真实地址，扫每个模块全部 import
+    //   descriptor 的 FirstThunk 数组，IAT 项值 == 真实地址 → 补丁。名字/序号/OFT 问题全绕开。
+    HMODULE ws2 = GetModuleHandleW(L"ws2_32.dll");
+    if (!ws2) { logf("[net] !! ws2_32 未加载 (%s)", fnName); return; }
+    const void* realFn = (const void*)GetProcAddress(ws2, fnName);
+    if (!realFn) { logf("[net] !! GetProcAddress(%s) 失败", fnName); return; }
 
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
     if (snap == INVALID_HANDLE_VALUE) { logf("[net] !! module snapshot failed (%s)", fnName); return; }
@@ -1051,14 +1033,30 @@ static void patchAllModulesIat(const char* fnName, void* hook, void** origOut) {
     if (Module32FirstW(snap, &me)) {
         do {
             if ((HMODULE)me.hModule == (HMODULE)g_self) continue;   // 不补丁自己，防自环
-            // 名字导入
-            void* o = patchIat((HMODULE)me.hModule, "WS2_32.dll", fnName, hook);
-            // 序号导入（BBCenter.exe 主 IAT 走这条）
-            if (ord) o = o ? o : patchIatOrdinal((HMODULE)me.hModule, "WS2_32.dll", ord, hook);
-            if (!o) continue;
-            if (o == hook) continue;                                // 已打过，跳过
-            if (*origOut == nullptr) *origOut = o;
-            logf("[net] %-9s IAT patched in %ls orig=%p", fnName, me.szModule, o);
+            HMODULE mod = (HMODULE)me.hModule;
+            auto dos = (PIMAGE_DOS_HEADER)mod;
+            if (dos->e_lfanew <= 0 || dos->e_lfanew > 0x10000000) continue;
+            auto nt = (PIMAGE_NT_HEADERS)((BYTE*)mod + dos->e_lfanew);
+            if (nt->Signature != IMAGE_NT_SIGNATURE) continue;
+            const auto& imp = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+            if (!imp.VirtualAddress) continue;
+            auto desc = (PIMAGE_IMPORT_DESCRIPTOR)((BYTE*)mod + imp.VirtualAddress);
+            for (; desc->Name; ++desc) {
+                auto ft = (PIMAGE_THUNK_DATA)((BYTE*)mod + desc->FirstThunk);
+                if (!desc->FirstThunk) continue;
+                for (; ft->u1.AddressOfData; ++ft) {
+                    if (ft->u1.Function != (ULONG_PTR)realFn) continue;
+                    void* orig = (void*)ft->u1.Function;
+                    DWORD old = 0;
+                    if (VirtualProtect(&ft->u1.Function, sizeof(void*), PAGE_READWRITE, &old)) {
+                        ft->u1.Function = (ULONG_PTR)hook;
+                        VirtualProtect(&ft->u1.Function, sizeof(void*), old, &old);
+                        if (*origOut == nullptr) *origOut = orig;
+                        logf("[net] %-9s IAT patched in %ls orig=%p", fnName, me.szModule, orig);
+                    }
+                    break;   // 该 descriptor 内此项已处理（同函数可能多处 descriptor，外层继续扫）
+                }
+            }
         } while (Module32NextW(snap, &me));
     }
     CloseHandle(snap);
