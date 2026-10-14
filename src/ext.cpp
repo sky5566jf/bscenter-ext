@@ -574,6 +574,34 @@ static void* patchIat(HMODULE mod, const char* dllName, const char* fnName, void
     return nullptr;
 }
 
+// 按序号补丁 IAT（BBCenter.exe 对 ws2_32 为序号导入）
+static void* patchIatOrdinal(HMODULE mod, const char* dllName, WORD ordinal, void* newFn) {
+    if (!mod) return nullptr;
+    auto dos = (PIMAGE_DOS_HEADER)mod;
+    auto nt = (PIMAGE_NT_HEADERS)((BYTE*)mod + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;
+    const auto& imp = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!imp.VirtualAddress) return nullptr;
+    auto desc = (PIMAGE_IMPORT_DESCRIPTOR)((BYTE*)mod + imp.VirtualAddress);
+    for (; desc->Name; ++desc) {
+        const char* name = (const char*)((BYTE*)mod + desc->Name);
+        if (_stricmp(name, dllName) != 0) continue;
+        auto ft = (PIMAGE_THUNK_DATA)((BYTE*)mod + desc->FirstThunk);
+        for (; ft->u1.AddressOfData; ++ft) {
+            if (!(ft->u1.Ordinal & IMAGE_ORDINAL_FLAG)) continue;       // 只要序号项
+            if (IMAGE_ORDINAL(ft->u1.Ordinal) != ordinal) continue;
+            void* orig = (void*)ft->u1.Function;
+            DWORD old = 0;
+            if (VirtualProtect(&ft->u1.Function, sizeof(void*), PAGE_READWRITE, &old)) {
+                ft->u1.Function = (ULONG_PTR)newFn;
+                VirtualProtect(&ft->u1.Function, sizeof(void*), old, &old);
+            }
+            return orig;
+        }
+    }
+    return nullptr;
+}
+
 typedef QAction* (*ExecFn)(QMenu*, const QPoint&, QAction*);
 static ExecFn g_origExec = nullptr;
 
@@ -989,13 +1017,44 @@ static int WINAPI hookSendTo(SockT s, const char* buf, int len, int flags,
 }
 
 static void patchAllModulesIat(const char* fnName, void* hook, void** origOut) {
+    // ★ v0.12 根因修复：BBCenter.exe 对 ws2_32 是【按序号(ordinal)】导入（导入表只有
+    //   "WS2_32.dll" 一个字符串、零函数名字符串）——旧 patchIat 遇序号项直接 continue，
+    //   中控自己的设备协议 socket 从未被 hook → 0 帧根因之二（叠加异步 IO_PENDING）。
+    //   这里先从 ws2_32 导出表解析目标函数序号，序号项同名同补。
+    static QHash<QString, WORD> ordCache;
+    WORD ord = 0;
+    if (!ordCache.contains(QString::fromLatin1(fnName))) {
+        HMODULE ws2 = GetModuleHandleW(L"ws2_32.dll");
+        if (ws2) {
+            auto dos = (PIMAGE_DOS_HEADER)ws2;
+            auto nt = (PIMAGE_NT_HEADERS)((BYTE*)ws2 + dos->e_lfanew);
+            const auto& ed = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+            if (ed.VirtualAddress) {
+                auto exp = (PIMAGE_EXPORT_DIRECTORY)((BYTE*)ws2 + ed.VirtualAddress);
+                auto names = (DWORD*)((BYTE*)ws2 + exp->AddressOfNames);
+                auto ords  = (WORD*)((BYTE*)ws2 + exp->AddressOfNameOrdinals);
+                for (DWORD i = 0; i < exp->NumberOfNames; ++i) {
+                    if (_stricmp((const char*)((BYTE*)ws2 + names[i]), fnName) == 0) {
+                        ordCache[QString::fromLatin1(fnName)] = (WORD)(exp->Base + ords[i]);
+                        break;
+                    }
+                }
+            }
+        }
+        if (!ordCache.contains(QString::fromLatin1(fnName))) ordCache[QString::fromLatin1(fnName)] = 0;
+    }
+    ord = ordCache.value(QString::fromLatin1(fnName), 0);
+
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
     if (snap == INVALID_HANDLE_VALUE) { logf("[net] !! module snapshot failed (%s)", fnName); return; }
     MODULEENTRY32W me; memset(&me, 0, sizeof(me)); me.dwSize = sizeof(me);
     if (Module32FirstW(snap, &me)) {
         do {
             if ((HMODULE)me.hModule == (HMODULE)g_self) continue;   // 不补丁自己，防自环
+            // 名字导入
             void* o = patchIat((HMODULE)me.hModule, "WS2_32.dll", fnName, hook);
+            // 序号导入（BBCenter.exe 主 IAT 走这条）
+            if (ord) o = o ? o : patchIatOrdinal((HMODULE)me.hModule, "WS2_32.dll", ord, hook);
             if (!o) continue;
             if (o == hook) continue;                                // 已打过，跳过
             if (*origOut == nullptr) *origOut = o;
