@@ -718,7 +718,7 @@ static bool invokeSlotLoose(QObject* obj, const char* bare, QString& where) {
     for (int i = 0; i < mo->methodCount(); ++i) {
         const QMetaMethod mm = mo->method(i);
         if (mm.methodType() != QMetaMethod::Slot) continue;
-        if (mm.name() != QLatin1String(bare)) continue;
+        if (qstrcmp(mm.name().constData(), bare) != 0) continue;
         const int pc = mm.parameterCount();
         if (pc == 0) {
             if (mm.invoke(obj, Qt::DirectConnection)) {
