@@ -708,6 +708,22 @@ static void dumpButtons(const char* why) {
 static QAbstractButton* g_runBtn = nullptr;
 static QAbstractButton* g_stopBtn = nullptr;
 
+// use_check=1 触发成功后 2s 取消勾选（按 devId 重找行，防行序漂移），
+// 避免勾选残留污染「批量锁定/解锁以勾选行为目标」的语义
+static void uncheckLater(QAbstractItemModel* m, int row, const QString& id) {
+    QTimer::singleShot(2000, QCoreApplication::instance(), [m, row, id] {
+        if (!m) return;
+        int r = rowOfDevId(m, g_cols.id, id);
+        if (r < 0) r = row;
+        const QModelIndex ci = m->index(r, 0);
+        if (ci.isValid() && (m->flags(ci) & Qt::ItemIsUserCheckable) &&
+            m->data(ci, Qt::CheckStateRole).toInt() == Qt::Checked) {
+            m->setData(ci, Qt::Unchecked, Qt::CheckStateRole);
+            logf("[watch] 触发完成，已取消勾选 dev=%s", id.toUtf8().constData());
+        }
+    });
+}
+
 static bool triggerRun(int row, const char* why) {
     if (!g_view) return false;
     QAbstractItemModel* m = g_view->model();
@@ -740,31 +756,46 @@ static bool triggerRun(int row, const char* why) {
             m->setData(ci, Qt::Checked, Qt::CheckStateRole);
     }
 
+    const bool p2 = (g_cfg.route == QStringLiteral("p2"));
     if (g_cfg.confirmByButtons) {
         if (g_stopBtn && g_stopBtn->isEnabled()) {
             logf("[watch] dev=%s 选中后 stopButton=可用 -> 判定在跑，不点", id.toUtf8().constData());
             return true;
         }
-        if (g_runBtn && !g_runBtn->isEnabled()) {
+        // p2 直调槽函数，不受按钮禁用状态限制 —— 只在 p1（模拟点击）时检查
+        if (!p2 && g_runBtn && !g_runBtn->isEnabled()) {
             logf("[watch] dev=%s 选中后 runButton=不可用 -> 设备不可运行，跳过", id.toUtf8().constData());
             return false;
         }
     }
 
-    if (g_cfg.route == QStringLiteral("p2")) {
+    if (p2) {
         QObject* owner = g_win;
-        if (owner) {
-            bool ok = QMetaObject::invokeMethod(owner, "on_runButton_clicked", Qt::DirectConnection);
-            if (!ok) ok = QMetaObject::invokeMethod(owner, "onRunScript", Qt::DirectConnection);
-            logf("[watch] invoke on_runButton_clicked/onRunScript -> %d (row=%d dev=%s)", (int)ok, row,
-                 id.toUtf8().constData());
-            return ok;
+        bool ok = false;
+        if (owner)
+            ok = QMetaObject::invokeMethod(owner, "on_runButton_clicked", Qt::DirectConnection);
+        if (!ok) {
+            // 兜底：全 widget 扫一遍，找到真正带这个槽的对象
+            for (QWidget* w : QApplication::allWidgets()) {
+                if (w->metaObject()->indexOfSlot("on_runButton_clicked") >= 0) {
+                    ok = QMetaObject::invokeMethod(w, "on_runButton_clicked", Qt::DirectConnection);
+                    if (ok) {
+                        logf("[watch] p2 slot found on class=%s objectName=%s",
+                             w->metaObject()->className(), w->objectName().toUtf8().constData());
+                        break;
+                    }
+                }
+            }
         }
-        return false;
+        if (ok && g_cfg.useCheck) uncheckLater(m, row, id);
+        logf("[watch] p2 invoke on_runButton_clicked -> %d (row=%d dev=%s)", (int)ok, row,
+             id.toUtf8().constData());
+        return ok;
     }
 
     if (!g_runBtn) { logf("[watch] !! runButton not found（见 [btn:*] 日志），why=%s", why); return false; }
     g_runBtn->click();
+    if (g_cfg.useCheck) uncheckLater(m, row, id);
     logf("[watch] clicked runButton (row=%d dev=%s, stopEnabled=%d, why=%s)",
          row, id.toUtf8().constData(), (int)(g_stopBtn ? g_stopBtn->isEnabled() : -1), why);
     return true;
