@@ -42,6 +42,7 @@
 #include <QAction>
 #include <QTimer>
 #include <QMetaObject>
+#include <QMetaMethod>
 #include <QString>
 #include <QStringList>
 #include <QJsonDocument>
@@ -708,6 +709,50 @@ static void dumpButtons(const char* why) {
 static QAbstractButton* g_runBtn = nullptr;
 static QAbstractButton* g_stopBtn = nullptr;
 
+// 按裸名松散调用槽：扫对象的槽表，0 参直接调；1 参 bool 填 false（对应 clicked(bool) 自动连接的槽）。
+// where 回填命中位置（类名::完整签名），全部未命中回填 ""。
+static bool invokeSlotLoose(QObject* obj, const char* bare, QString& where) {
+    where.clear();
+    if (!obj) return false;
+    const QMetaObject* mo = obj->metaObject();
+    for (int i = 0; i < mo->methodCount(); ++i) {
+        const QMetaMethod mm = mo->method(i);
+        if (mm.methodType() != QMetaMethod::Slot) continue;
+        if (mm.name() != QLatin1String(bare)) continue;
+        const int pc = mm.parameterCount();
+        if (pc == 0) {
+            if (mm.invoke(obj, Qt::DirectConnection)) {
+                where = QStringLiteral("%1::%2()").arg(mo->className(), QLatin1String(mm.methodSignature()));
+                return true;
+            }
+            continue;
+        }
+        if (pc == 1 && mm.parameterType(0) == QMetaType::Bool) {
+            if (mm.invoke(obj, Qt::DirectConnection, Q_ARG(bool, false))) {
+                where = QStringLiteral("%1::%2").arg(mo->className(), QLatin1String(mm.methodSignature()));
+                return true;
+            }
+            continue;
+        }
+        // 其他参数组合：照原样试一次（QMetaMethod::invoke 对缺参调用会失败，失败就跳过）
+        if (mm.invoke(obj, Qt::DirectConnection)) {
+            where = QStringLiteral("%1::%2").arg(mo->className(), QLatin1String(mm.methodSignature()));
+            return true;
+        }
+    }
+    return false;
+}
+
+// 深扫：槽主可能不是 QWidget（QObject 控制器），沿对象树递归找（限深 6 层）
+static bool invokeDeep(QObject* o, const char* bare, QString& where, int depth = 0) {
+    if (!o || depth > 6) return false;
+    if (invokeSlotLoose(o, bare, where)) return true;
+    for (QObject* c : o->children()) {
+        if (invokeDeep(c, bare, where, depth + 1)) return true;
+    }
+    return false;
+}
+
 // use_check=1 触发成功后 2s 取消勾选（按 devId 重找行，防行序漂移），
 // 避免勾选残留污染「批量锁定/解锁以勾选行为目标」的语义
 static void uncheckLater(QAbstractItemModel* m, int row, const QString& id) {
@@ -770,26 +815,32 @@ static bool triggerRun(int row, const char* why) {
     }
 
     if (p2) {
-        QObject* owner = g_win;
+        // 松散调用：按裸名扫槽表（on_runButton_clicked 可能是 0 参，也可能是 clicked(bool) 连的 1 参）
         bool ok = false;
-        if (owner)
-            ok = QMetaObject::invokeMethod(owner, "on_runButton_clicked", Qt::DirectConnection);
+        QString where;
+        QObject* owner = g_win;
+        if (owner) ok = invokeSlotLoose(owner, "on_runButton_clicked", where);
         if (!ok) {
-            // 兜底：全 widget 扫一遍，找到真正带这个槽的对象
             for (QWidget* w : QApplication::allWidgets()) {
-                if (w->metaObject()->indexOfSlot("on_runButton_clicked") >= 0) {
-                    ok = QMetaObject::invokeMethod(w, "on_runButton_clicked", Qt::DirectConnection);
-                    if (ok) {
-                        logf("[watch] p2 slot found on class=%s objectName=%s",
-                             w->metaObject()->className(), w->objectName().toUtf8().constData());
-                        break;
-                    }
-                }
+                ok = invokeSlotLoose(w, "on_runButton_clicked", where);
+                if (ok) break;
             }
         }
+        if (!ok) ok = invokeDeep(QCoreApplication::instance(), "on_runButton_clicked", where);
+        if (!ok) {
+            // 再试 onRunScript（moc 字符串里也有它）
+            if (owner) ok = invokeSlotLoose(owner, "onRunScript", where);
+            if (!ok) {
+                for (QWidget* w : QApplication::allWidgets()) {
+                    ok = invokeSlotLoose(w, "onRunScript", where);
+                    if (ok) break;
+                }
+            }
+            if (!ok) ok = invokeDeep(QCoreApplication::instance(), "onRunScript", where);
+        }
         if (ok && g_cfg.useCheck) uncheckLater(m, row, id);
-        logf("[watch] p2 invoke on_runButton_clicked -> %d (row=%d dev=%s)", (int)ok, row,
-             id.toUtf8().constData());
+        logf("[watch] p2 invoke -> %d (row=%d dev=%s slot=%s)",
+             (int)ok, row, id.toUtf8().constData(), where.toUtf8().constData());
         return ok;
     }
 
