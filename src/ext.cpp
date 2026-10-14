@@ -147,8 +147,17 @@ static void loadConfig() {
     g_cfg.route            = s.value("ext/trigger_route", "p1").toString();
     g_cfg.columnMode       = s.value("ext/column_mode", "insert").toString().trimmed().toLower();
     if (g_cfg.columnMode != QStringLiteral("proxy")) g_cfg.columnMode = QStringLiteral("insert");
-    g_cfg.runningWords     = s.value("ext/running_words", "运行,播放,投屏,启动,工作中,已开,开始").toString();
-    g_cfg.idleMarkers      = s.value("ext/idle_markers", "未,停止,关闭,失败,断开,无,空闲,空,不在线").toString();
+    g_cfg.runningWords     = s.value("ext/running_words").toString();
+    g_cfg.idleMarkers      = s.value("ext/idle_markers").toString();
+    logf("[cfg] raw running_words='%s' idle_markers='%s'",
+         g_cfg.runningWords.toUtf8().constData(),
+         g_cfg.idleMarkers.toUtf8().constData());
+    // ★ 代码内置兜底：ini 读不到（编码/缺键）就用源码词表，判定永不落空
+    //   实测（2026-10-14）：运行列真实值只有 '--'（未连接）/'空闲'（没跑）/'运行'（在跑）
+    if (splitWords(g_cfg.runningWords).isEmpty())
+        g_cfg.runningWords = QStringLiteral("运行,播放,投屏,暂停,工作中,已开,开始");
+    if (splitWords(g_cfg.idleMarkers).isEmpty())
+        g_cfg.idleMarkers = QStringLiteral("空闲,未,停止,关闭,失败,断开,不在线");
     g_runningWords = splitWords(g_cfg.runningWords);
     g_idleMarkers  = splitWords(g_cfg.idleMarkers);
     logf("[cfg] enabled=%d dry_run=%d enable_column=%d column_mode=%s sweep=%dms cooldown=%dms max_retry=%d route=%s",
@@ -407,8 +416,8 @@ static void applyColumnInsert() {
         logf("[column] inserted extra col idx=%d (cols %d -> %d)", g_extCol, old, stdm->columnCount());
     }
     if (stdm->headerData(g_extCol, Qt::Horizontal, Qt::DisplayRole).toString()
-            != QStringLiteral("保活锁定")) {
-        stdm->setHeaderData(g_extCol, Qt::Horizontal, QStringLiteral("保活锁定"));
+            != QStringLiteral("锁定状态")) {
+        stdm->setHeaderData(g_extCol, Qt::Horizontal, QStringLiteral("锁定状态"));
     }
     g_view->setColumnWidth(g_extCol, 96);
     if (!g_extDelegate) {
@@ -433,7 +442,7 @@ public:
     }
     QVariant headerData(int section, Qt::Orientation o, int role) const override {
         if (o == Qt::Horizontal && section == extraCol())
-            return role == Qt::DisplayRole ? QStringLiteral("保活锁定") : QVariant();
+            return role == Qt::DisplayRole ? QStringLiteral("锁定状态") : QVariant();
         return QIdentityProxyModel::headerData(section, o, role);
     }
     QModelIndex index(int row, int column, const QModelIndex& parent = QModelIndex()) const override {
@@ -503,7 +512,7 @@ static void ensureColumn() {
     if (!stdm) return;
     const bool need =
         (g_std != stdm) || (g_extCol < 0) || (stdm->columnCount() <= g_extCol) ||
-        (stdm->headerData(g_extCol, Qt::Horizontal, Qt::DisplayRole).toString() != QStringLiteral("保活锁定"));
+        (stdm->headerData(g_extCol, Qt::Horizontal, Qt::DisplayRole).toString() != QStringLiteral("锁定状态"));
     if (need) {
         logf("[column] ensure -> re-apply (model=%p extCol=%d cols=%d)", (void*)stdm, g_extCol, stdm->columnCount());
         applyColumnInsert();
@@ -620,8 +629,8 @@ static QAction* hookExec(QMenu* self, const QPoint& pos, QAction* at) {
 
     QAction* sep     = self->addSeparator();
     QAction* aDump   = self->addAction(QStringLiteral("[EXT] 自检：导出设备列表"));
-    QAction* aLock   = self->addAction(QStringLiteral("[EXT] 🔒 开启保活锁定"));
-    QAction* aUnlock = self->addAction(QStringLiteral("[EXT] 🔓 取消保活锁定"));
+    QAction* aLock   = self->addAction(QStringLiteral("[EXT] 🔒 开启锁定"));
+    QAction* aUnlock = self->addAction(QStringLiteral("[EXT] 🔓 取消锁定"));
     for (QAction* a : {sep, aDump, aLock, aUnlock}) a->setObjectName(QLatin1String(kExtMark));
 
     const int row = currentRow();
@@ -823,15 +832,20 @@ static void sweep() {
                 }
                 continue;
             }
-            if (g_cfg.requireConn && g_cols.conn >= 0 &&
-                !cellText(m, row, g_cols.conn).contains(QStringLiteral("已连接"))) {
-                noteSkip(QStringLiteral("设备未连接（require_conn=1，置 0 可绕过）"));
-                continue;
+            if (g_cfg.requireConn && g_cols.conn >= 0) {
+                const QString cv = cellText(m, row, g_cols.conn);
+                // 实测真实值：'未连接'（空闲）/ '连接'（已连）——不能按「已连接」匹配
+                if (!cv.contains(QStringLiteral("连接")) || cv.contains(QStringLiteral("未"))) {
+                    noteSkip(QStringLiteral("设备未连接(原文=%1)").arg(cv));
+                    continue;
+                }
             }
-            if (g_cfg.requireAuth && g_cols.auth >= 0 &&
-                !cellText(m, row, g_cols.auth).contains(QStringLiteral("已授权"))) {
-                noteSkip(QStringLiteral("设备未授权（require_auth=1，置 0 可绕过）"));
-                continue;
+            if (g_cfg.requireAuth && g_cols.auth >= 0) {
+                const QString av = cellText(m, row, g_cols.auth);
+                if (av.contains(QStringLiteral("未")) || av.isEmpty()) {
+                    noteSkip(QStringLiteral("设备未授权(原文=%1)").arg(av));
+                    continue;
+                }
             }
             if (now - it->lastTrigger < g_cfg.cooldownMs) {
                 noteSkip(QStringLiteral("触发冷却中（cooldown_ms=%1）").arg(g_cfg.cooldownMs));

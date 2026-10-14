@@ -13,7 +13,7 @@ find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets)
 
 add_library(bbcenter_ext SHARED src/ext.cpp)
 target_link_libraries(bbcenter_ext PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets)
-target_compile_definitions(bbcenter_ext PRIVATE BBEXT_VER="0.3.1-poc")
+target_compile_definitions(bbcenter_ext PRIVATE BBEXT_VER="0.4-poc")
 
 add_executable(BBCenterLoader src/loader.cpp)
-target_compile_definitions(BBCenterLoader PRIVATE BBEXT_VER="0.3.1-poc")
+target_compile_definitions(BBCenterLoader PRIVATE BBEXT_VER="0.4-poc")
