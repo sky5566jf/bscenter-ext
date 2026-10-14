@@ -949,11 +949,13 @@ static void noteSend(SockT s, const char* buf, int len, uint32_t ipKnown = 0, ui
 static int WINAPI hookWSASend(SockT s, WSABUF_* bufs, DWORD cnt, DWORD* sent,
                               DWORD flags, void* ov, void* ext) {
     const int r = g_origWSASend(s, bufs, cnt, sent, flags, ov, ext);
-    if (r == 0) {
-        DWORD done = sent ? *sent : 0, acc = 0;
-        for (DWORD i = 0; i < cnt && acc < done; ++i) {
+    const int le = GetLastError();
+    // Qt 走 IOCP 异步发送：入队成功返回 SOCKET_ERROR + ERROR_IO_PENDING(997)，不是 0！
+    // v0.9/v0.10 只捕 r==0 → 异步帧全漏 → 0 帧根因（2026-10-15 00:01 实锤：人工点击设备
+    // 1s 内跑起来但窗口 0 帧）。同步(0)与异步入队(IO_PENDING)都捕获。
+    if (r == 0 || (r == -1 && le == ERROR_IO_PENDING)) {
+        for (DWORD i = 0; i < cnt; ++i) {
             noteSend(s, bufs[i].buf, (int)bufs[i].len);
-            acc += bufs[i].len;
         }
     }
     return r;
@@ -962,12 +964,11 @@ static int WINAPI hookWSASend(SockT s, WSABUF_* bufs, DWORD cnt, DWORD* sent,
 static int WINAPI hookWSASendTo(SockT s, WSABUF_* bufs, DWORD cnt, DWORD* sent,
                                 DWORD flags, const SockAddrIn_* to, int tolen, void* ov, void* ext) {
     const int r = g_origWSASendTo(s, bufs, cnt, sent, flags, to, tolen, ov, ext);
-    if (r == 0 && to && to->family == 2) {
-        DWORD done = sent ? *sent : 0, acc = 0;
+    const int le = GetLastError();
+    if ((r == 0 || (r == -1 && le == ERROR_IO_PENDING)) && to && to->family == 2) {
         const uint16_t p = (uint16_t)((to->port >> 8) | (to->port << 8));
-        for (DWORD i = 0; i < cnt && acc < done; ++i) {
+        for (DWORD i = 0; i < cnt; ++i) {
             noteSend(s, bufs[i].buf, (int)bufs[i].len, to->saddr, p);
-            acc += bufs[i].len;
         }
     }
     return r;
