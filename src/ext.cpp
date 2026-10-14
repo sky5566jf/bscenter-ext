@@ -20,6 +20,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
+#include <tlhelp32.h>
 #include <cstdio>
 #include <cstdarg>
 #include <cstring>
@@ -42,6 +43,7 @@
 #include <QAction>
 #include <QTimer>
 #include <QMouseEvent>
+#include <QEvent>
 #include <QMetaObject>
 #include <QMetaMethod>
 #include <QString>
@@ -812,25 +814,37 @@ static void uncheckLaterClick(const QString& id) {
 }
 
 // ---------------------------------------------------------------- P4 网络帧捕获与重放
-// 实测：Qt6Network.dll 的 WS2_32 IAT 只有 WSASend（无 send）→ 中控全部出方向数据走 WSASend。
-// hook 它 = 看到中控发出的每一条帧。人工点一次「运行」→ 设备状态 '空闲'->'运行' 翻转的瞬间，
-// 取前 5s 内「新出现」的帧（同内容 5s~120s 前也出现过 = 周期心跳，排除）存为该 IP 的运行帧模板；
-// p4 触发 = 对该设备现役 socket 原样重放模板帧，完全不依赖 Qt 层。
+// v0.9 教训：只 hook Qt6Network.dll 的 IAT → 2.5 分钟内 0 条帧 → 学不到模板。
+// v0.10 加固：
+//  ① 全模块 IAT 扫描：枚举进程内每个已加载模块，对各自 WS2_32.dll IAT 补丁
+//     WSASend / WSASendTo / send / sendto 四个出方向口（排除自己），60s 重扫一遍
+//     兜住晚加载模块；已打过的（IAT 值==hook 地址）跳过，防二次取 orig 造成自环。
+//  ② runButton 事件过滤器：人工按下「运行」瞬间开 5s 抓帧窗口，窗口内非周期
+//     出方向帧按对端 IP 直接存为运行模板候选 —— 不依赖设备状态翻转，点击没生效
+//     也能学到命令帧。
+//  ③ 帧缓冲 256B -> 1024B，日志带对端端口；重放按帧逐条发送（不再拼接，防破坏分帧）。
 
 typedef uintptr_t SockT;
 struct SockAddrIn_ { uint16_t family; uint16_t port; uint32_t saddr; char pad[8]; };
 struct WSABUF_     { unsigned long len; char* buf; };
-typedef int (WINAPI *WSASend_t)(SockT, WSABUF_*, DWORD, DWORD*, DWORD, void*, void*);
-typedef int (WINAPI *Gpn_t)    (SockT, SockAddrIn_*, int*);
+typedef int (WINAPI *WSASend_t)  (SockT, WSABUF_*, DWORD, DWORD*, DWORD, void*, void*);
+typedef int (WINAPI *WSASendTo_t)(SockT, WSABUF_*, DWORD, DWORD*, DWORD, const SockAddrIn_*, int, void*, void*);
+typedef int (WINAPI *Send_t)     (SockT, const char*, int, int);
+typedef int (WINAPI *SendTo_t)   (SockT, const char*, int, int, const SockAddrIn_*, int);
+typedef int (WINAPI *Gpn_t)      (SockT, SockAddrIn_*, int*);
 
-static WSASend_t g_origWSASend = nullptr;
-static Gpn_t     g_gpn         = nullptr;
+static WSASend_t    g_origWSASend   = nullptr;
+static WSASendTo_t  g_origWSASendTo = nullptr;
+static Send_t       g_origSend      = nullptr;
+static SendTo_t     g_origSendTo    = nullptr;
+static Gpn_t        g_gpn           = nullptr;
 
-struct NetFrame { qint64 ts = 0; uint32_t ip = 0; int len = 0; char data[256]; };
+struct NetFrame { qint64 ts = 0; uint32_t ip = 0; uint16_t port = 0; int len = 0; char data[1024]; };
 static std::mutex                             g_netMx;
 static QHash<SockT, uint32_t>                 g_sockIp;   // socket -> 设备 IP（sin_addr 原值）
 static QList<NetFrame>                        g_ring;     // 近 120s 出方向帧
 static QHash<uint32_t, QList<NetFrame> >      g_runTpl;   // 学习到的运行帧候选（按 IP）
+static qint64                                 g_armUntil = 0;   // runButton 抓帧窗口截止时刻
 
 static QString ipStr(uint32_t v) {   // v = sockaddr_in.sin_addr 原值（网络序存于小端整型）
     return QString::number(v & 0xff) + QLatin1Char('.') + QString::number((v >> 8) & 0xff) +
@@ -854,39 +868,81 @@ static uint32_t ipToKey(const QString& s) {
 static QString hexOf(const char* d, int n) {
     static const char* hx = "0123456789ABCDEF";
     QString s;
-    const int m = n < 64 ? n : 64;
+    const int m = n < 128 ? n : 128;
     for (int i = 0; i < m; ++i) {
         const unsigned char c = (unsigned char)d[i];
         s += QLatin1Char(hx[c >> 4]); s += QLatin1Char(hx[c & 15]); s += QLatin1Char(' ');
     }
+    if (n > 128) s += QStringLiteral("...(%1B)").arg(n);
     return s.trimmed();
 }
 
-static void noteSend(SockT s, const char* buf, int len) {
+// 需持 g_netMx：同内容 5s~120s 前出现过 = 周期心跳
+static bool looksPeriodicLocked(uint32_t ip, const NetFrame& f) {
+    for (const NetFrame& g : g_ring) {
+        if (g.ip != ip || g.ts >= f.ts) continue;
+        if (g.len != f.len) continue;
+        if (memcmp(g.data, f.data, f.len < 1024 ? f.len : 1024) != 0) continue;
+        const qint64 dt = f.ts - g.ts;
+        if (dt > 5000 && dt <= 120000) return true;
+    }
+    return false;
+}
+
+// 需持 g_netMx：模板去重追加
+static void tplAddLocked(uint32_t ip, const NetFrame& f) {
+    QList<NetFrame>& lst = g_runTpl[ip];
+    for (const NetFrame& g : lst) {
+        if (g.len == f.len && memcmp(g.data, f.data, f.len) == 0) return;   // 已有
+    }
+    lst.append(f);
+    if (lst.size() > 16) lst.removeFirst();
+}
+
+static void noteSend(SockT s, const char* buf, int len, uint32_t ipKnown = 0, uint16_t portKnown = 0) {
     if (len <= 0 || !buf) return;
     NetFrame f;
     f.ts = QDateTime::currentMSecsSinceEpoch();
     f.len = len;
-    memcpy(f.data, buf, len < 256 ? len : 256);
+    memcpy(f.data, buf, len < 1024 ? len : 1024);
     {
         std::lock_guard<std::mutex> lk(g_netMx);
-        if (!g_sockIp.value(s, 0) && g_gpn) {
+        if (!ipKnown && !g_sockIp.value(s, 0) && g_gpn) {
             SockAddrIn_ sa; memset(&sa, 0, sizeof(sa));
             int n = sizeof(sa);
-            if (g_gpn(s, &sa, &n) == 0 && sa.family == 2) g_sockIp[s] = sa.saddr;
+            if (g_gpn(s, &sa, &n) == 0 && sa.family == 2) {
+                g_sockIp[s] = sa.saddr;
+                f.port = (uint16_t)((sa.port >> 8) | (sa.port << 8));   // ntoh 展示
+            }
         }
-        f.ip = g_sockIp.value(s, 0);
+        f.ip = ipKnown ? ipKnown : g_sockIp.value(s, 0);
+        if (portKnown) f.port = portKnown;
         g_ring.append(f);
-        while (g_ring.size() > 512) g_ring.removeFirst();
+        while (g_ring.size() > 1024) g_ring.removeFirst();
         const qint64 cutoff = f.ts - 120000;
         while (!g_ring.isEmpty() && g_ring.first().ts < cutoff) g_ring.removeFirst();
+
+        // runButton 抓帧窗口：窗口内非周期帧直接入模板候选
+        if (f.ip && f.ts < g_armUntil && !looksPeriodicLocked(f.ip, f)) {
+            tplAddLocked(f.ip, f);
+            logf("[netarm] ip=%s:%u len=%d hex=%s", ipStr(f.ip).toUtf8().constData(),
+                 (unsigned)f.port, f.len, hexOf(f.data, f.len).toUtf8().constData());
+        }
     }
-    // 日志限流：只完整打前 80 条（含心跳，便于人工核对）
+    // 日志限流：前 200 条全打，之后每 3s 一条节流心跳
     static int logged = 0;
-    if (logged < 80) {
-        ++logged;
-        logf("[net] ip=%s sock=%p len=%d hex=%s", ipStr(f.ip).toUtf8().constData(),
-             (void*)(uintptr_t)s, f.len, hexOf(f.data, f.len).toUtf8().constData());
+    static qint64 lastFlow = 0;
+    ++logged;
+    if (logged <= 200) {
+        logf("[net] ip=%s:%u sock=%p len=%d hex=%s", ipStr(f.ip).toUtf8().constData(),
+             (unsigned)f.port, (void*)(uintptr_t)s, f.len, hexOf(f.data, f.len).toUtf8().constData());
+    } else {
+        const qint64 now = QDateTime::currentMSecsSinceEpoch();
+        if (now - lastFlow > 3000) {
+            lastFlow = now;
+            logf("[net] ...(已捕获 %d 条, 节流) 最近: ip=%s:%u len=%d", logged,
+                 ipStr(f.ip).toUtf8().constData(), (unsigned)f.port, f.len);
+        }
     }
 }
 
@@ -903,17 +959,108 @@ static int WINAPI hookWSASend(SockT s, WSABUF_* bufs, DWORD cnt, DWORD* sent,
     return r;
 }
 
+static int WINAPI hookWSASendTo(SockT s, WSABUF_* bufs, DWORD cnt, DWORD* sent,
+                                DWORD flags, const SockAddrIn_* to, int tolen, void* ov, void* ext) {
+    const int r = g_origWSASendTo(s, bufs, cnt, sent, flags, to, tolen, ov, ext);
+    if (r == 0 && to && to->family == 2) {
+        DWORD done = sent ? *sent : 0, acc = 0;
+        const uint16_t p = (uint16_t)((to->port >> 8) | (to->port << 8));
+        for (DWORD i = 0; i < cnt && acc < done; ++i) {
+            noteSend(s, bufs[i].buf, (int)bufs[i].len, to->saddr, p);
+            acc += bufs[i].len;
+        }
+    }
+    return r;
+}
+
+static int WINAPI hookSend(SockT s, const char* buf, int len, int flags) {
+    const int r = g_origSend(s, buf, len, flags);
+    if (r != -1) noteSend(s, buf, len);
+    return r;
+}
+
+static int WINAPI hookSendTo(SockT s, const char* buf, int len, int flags,
+                             const SockAddrIn_* to, int tolen) {
+    const int r = g_origSendTo(s, buf, len, flags, to, tolen);
+    if (r != -1 && to && to->family == 2)
+        noteSend(s, buf, len, to->saddr, (uint16_t)((to->port >> 8) | (to->port << 8)));
+    return r;
+}
+
+static void patchAllModulesIat(const char* fnName, void* hook, void** origOut) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    if (snap == INVALID_HANDLE_VALUE) { logf("[net] !! module snapshot failed (%s)", fnName); return; }
+    MODULEENTRY32W me; memset(&me, 0, sizeof(me)); me.dwSize = sizeof(me);
+    if (Module32FirstW(snap, &me)) {
+        do {
+            if ((HMODULE)me.hModule == (HMODULE)g_self) continue;   // 不补丁自己，防自环
+            void* o = patchIat((HMODULE)me.hModule, "WS2_32.dll", fnName, hook);
+            if (!o) continue;
+            if (o == hook) continue;                                // 已打过，跳过
+            if (*origOut == nullptr) *origOut = o;
+            logf("[net] %-9s IAT patched in %ls orig=%p", fnName, me.szModule, o);
+        } while (Module32NextW(snap, &me));
+    }
+    CloseHandle(snap);
+}
+
 static void installNetHooks() {
     HMODULE ws2 = GetModuleHandleW(L"ws2_32.dll");
     if (!ws2) { logf("[net] !! ws2_32 未加载"); return; }
     g_gpn = (Gpn_t)(void*)GetProcAddress(ws2, "getpeername");
-    HMODULE net = GetModuleHandleW(L"Qt6Network.dll");
-    if (!net) { logf("[net] !! Qt6Network.dll 未加载"); return; }
-    if (void* o = patchIat(net, "WS2_32.dll", "WSASend", (void*)&hookWSASend)) {
-        g_origWSASend = (WSASend_t)o;
-        logf("[net] WSASend hooked in Qt6Network.dll orig=%p", o);
-    } else {
-        logf("[net] !! Qt6Network.dll IAT 未找到 WSASend");
+    patchAllModulesIat("WSASend",   (void*)&hookWSASend,   (void**)&g_origWSASend);
+    patchAllModulesIat("WSASendTo", (void*)&hookWSASendTo, (void**)&g_origWSASendTo);
+    patchAllModulesIat("send",      (void*)&hookSend,      (void**)&g_origSend);
+    patchAllModulesIat("sendto",    (void*)&hookSendTo,    (void**)&g_origSendTo);
+    if (!g_origWSASend && !g_origWSASendTo && !g_origSend && !g_origSendTo)
+        logf("[net] !! 全模块扫描后未发现任何 WS2_32 发送函数 IAT（发送方可能动态 GetProcAddress）");
+    else
+        logf("[net] hooks ready: WSASend=%d WSASendTo=%d send=%d sendto=%d",
+             (int)(g_origWSASend != nullptr), (int)(g_origWSASendTo != nullptr),
+             (int)(g_origSend != nullptr), (int)(g_origSendTo != nullptr));
+}
+
+// ---- runButton 抓帧窗口（人工按下即开窗，不依赖点击是否生效） ----
+
+class RunBtnFilter : public QObject {
+public:
+    explicit RunBtnFilter(QObject* parent) : QObject(parent) {}
+    bool eventFilter(QObject* obj, QEvent* ev) override {
+        const QEvent::Type t = ev->type();
+        if (t == QEvent::MouseButtonPress || t == QEvent::MouseButtonRelease)
+            armCapture(t == QEvent::MouseButtonPress ? "runButton 按下" : "runButton 松开");
+        return QObject::eventFilter(obj, ev);
+    }
+    static void armCapture(const char* src) {
+        const qint64 now = QDateTime::currentMSecsSinceEpoch();
+        if (now < g_armUntil) return;
+        {
+            std::lock_guard<std::mutex> lk(g_netMx);
+            g_armUntil = now + 5000;
+        }
+        logf("[netarm] 抓帧窗口开启(%s)：未来 5s 非周期出方向帧按 IP 记为运行模板候选", src);
+    }
+};
+
+static RunBtnFilter* g_runFilter = nullptr;
+
+static void ensureRunFilter() {
+    if (!g_runBtn || g_runFilter) return;
+    g_runFilter = new RunBtnFilter(g_runBtn);
+    g_runBtn->installEventFilter(g_runFilter);
+    logf("[netarm] runButton 事件过滤器已安装");
+}
+
+// tick 里调：窗口结束后汇总一次
+static void armSweep() {
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (!g_armUntil || now <= g_armUntil) return;
+    std::lock_guard<std::mutex> lk(g_netMx);
+    g_armUntil = 0;
+    for (auto it = g_runTpl.begin(); it != g_runTpl.end(); ++it) {
+        if (it.value().isEmpty()) continue;
+        logf("[netarm] 窗口结束 ip=%s 模板候选 %d 条", ipStr(it.key()).toUtf8().constData(),
+             it.value().size());
     }
 }
 
@@ -988,17 +1135,14 @@ static bool triggerRun(int row, const char* why) {
         const uint32_t ipKey = ipToKey(cellText(m, row, g_cols.ip));
         if (!ipKey) { logf("[watch] p4 dev=%s 行 IP 无效（原文='%s'）", id.toUtf8().constData(),
                            cellText(m, row, g_cols.ip).toUtf8().constData()); return false; }
-        QByteArray frame;
+        QList<NetFrame> tpl;
         {
             std::lock_guard<std::mutex> lk(g_netMx);
-            const QList<NetFrame>& tpl = g_runTpl.value(ipKey);
-            for (const NetFrame& f : tpl) {
-                if (f.len > 0 && f.len <= 256) frame.append(f.data, f.len);
-            }
+            tpl = g_runTpl.value(ipKey);
         }
-        if (frame.isEmpty()) {
-            logf("[watch] p4 dev=%s 无运行帧模板 —— 请在锁定状态下人工点一次「运行」，我会自动学习",
-                 id.toUtf8().constData());
+        if (tpl.isEmpty()) {
+            logf("[watch] p4 dev=%s 无运行帧模板 —— 请锁定该设备后【人工用鼠标点一次「运行」按钮】，"
+                 "我会在按键瞬间自动抓帧学习（看 [netarm] 日志）", id.toUtf8().constData());
             return false;
         }
         SockT sock = 0;
@@ -1010,13 +1154,21 @@ static bool triggerRun(int row, const char* why) {
         if (!sock) { logf("[watch] p4 dev=%s 设备 socket 未找到（未连接？）",
                           id.toUtf8().constData()); return false; }
         if (!g_origWSASend) { logf("[watch] p4 !! WSASend 原函数不可用"); return false; }
-        WSABUF_ wb; wb.len = (unsigned long)frame.size(); wb.buf = (char*)frame.constData();
-        DWORD sent = 0;
-        const int r = g_origWSASend(sock, &wb, 1, &sent, 0, nullptr, nullptr);
-        logf("[watch] p4 sent %u/%d bytes -> sock=%p ret=%d dev=%s ip=%s",
-             (unsigned)sent, frame.size(), (void*)(uintptr_t)sock, r,
-             id.toUtf8().constData(), ipStr(ipKey).toUtf8().constData());
-        return r == 0 && sent == (DWORD)frame.size();
+        // 逐帧独立发送（不再拼接，防破坏协议分帧）；模板多条时帧间留 60ms
+        bool allOk = true;
+        for (int fi = 0; fi < tpl.size(); ++fi) {
+            const NetFrame& f = tpl[fi];
+            if (f.len <= 0 || f.len > 1024) continue;
+            WSABUF_ wb; wb.len = (unsigned long)f.len; wb.buf = (char*)f.data;
+            DWORD sent = 0;
+            const int r = g_origWSASend(sock, &wb, 1, &sent, 0, nullptr, nullptr);
+            logf("[watch] p4 frame%d/%d sent %u/%d bytes -> sock=%p ret=%d dev=%s ip=%s",
+                 fi + 1, tpl.size(), (unsigned)sent, f.len, (void*)(uintptr_t)sock, r,
+                 id.toUtf8().constData(), ipStr(ipKey).toUtf8().constData());
+            if (r != 0 || sent != (DWORD)f.len) allOk = false;
+            if (fi + 1 < tpl.size()) Sleep(60);
+        }
+        return allOk;
     }
 
     const bool p3 = (g_cfg.route == QStringLiteral("p3"));
@@ -1246,7 +1398,21 @@ static void sweep() {
 static void tick() {
     if (g_win && !g_view) locateWidgets();
     ensureColumn();                      // ★ 必须在取 g_devMx 之前（内部会读锁定态）
+    if (!g_runBtn) g_runBtn = findButton(QStringLiteral("runButton"));
+    ensureRunFilter();                   // 人工点「运行」瞬间抓帧
+    armSweep();                          // 抓帧窗口结束汇总
     if (!g_cfg.enabled) return;
+
+    // 60s 重扫全模块 IAT，兜住晚加载模块；已打过自动跳过（patchAllModulesIat 内判 hook 地址）
+    static qint64 lastRescan = 0;
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    if (nowMs - lastRescan > 60000) {
+        lastRescan = nowMs;
+        if (!g_origWSASend)   patchAllModulesIat("WSASend",   (void*)&hookWSASend,   (void**)&g_origWSASend);
+        if (!g_origWSASendTo) patchAllModulesIat("WSASendTo", (void*)&hookWSASendTo, (void**)&g_origWSASendTo);
+        if (!g_origSend)      patchAllModulesIat("send",      (void*)&hookSend,      (void**)&g_origSend);
+        if (!g_origSendTo)    patchAllModulesIat("sendto",    (void*)&hookSendTo,    (void**)&g_origSendTo);
+    }
 
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
     if (now - g_lastSweep < g_cfg.sweepMs) return;
